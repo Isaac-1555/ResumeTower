@@ -155,7 +155,7 @@ export default function Settings() {
       const message = err instanceof Error ? err.message : "Unknown error"
       if (message.includes("Failed to fetch") || message.includes("NetworkError")) {
         alert(
-          "Sync failed: Could not reach the poller server.\n\nMake sure it is running:\n  cd scripts && IMAP_SECRET_KEY='your_real_secret_here' npm start",
+          "Sync failed: Could not reach the poller server.\n\nIt should start automatically when you run `npm run dev` in `web/`.\nTry restarting the dev server. If needed, run it manually:\n  cd scripts && IMAP_SECRET_KEY='your_real_secret_here' npm start",
         )
       } else {
         alert("Sync failed: " + message)
