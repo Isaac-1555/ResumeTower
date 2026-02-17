@@ -133,8 +133,20 @@ export default function Settings() {
 
   const handleSyncNow = async () => {
     setSyncing(true)
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 180_000) // 3 min
     try {
-      const res = await fetch("http://localhost:54350/poll", { method: "POST" })
+      // Quick health check first
+      try {
+        const health = await fetch("http://localhost:54350/health", { signal: AbortSignal.timeout(3000) })
+        if (!health.ok) throw new Error("unhealthy")
+      } catch {
+        throw new Error(
+          "Could not reach the poller server.\n\nIt should start automatically when you run `npm run dev` in `web/`.\nTry restarting the dev server.",
+        )
+      }
+
+      const res = await fetch("http://localhost:54350/poll", { method: "POST", signal: controller.signal })
       if (!res.ok) {
         const body = await res.json().catch(() => null)
         throw new Error(body?.error || `Server returned ${res.status}`)
@@ -186,14 +198,13 @@ export default function Settings() {
     } catch (err) {
       console.error(err)
       const message = err instanceof Error ? err.message : "Unknown error"
-      if (message.includes("Failed to fetch") || message.includes("NetworkError")) {
-        alert(
-          "Sync failed: Could not reach the poller server.\n\nIt should start automatically when you run `npm run dev` in `web/`.\nTry restarting the dev server. If needed, run it manually:\n  cd scripts && IMAP_SECRET_KEY='your_real_secret_here' npm start",
-        )
+      if (controller.signal.aborted) {
+        alert("Sync timed out after 3 minutes. The poller may still be processing in the background.")
       } else {
         alert("Sync failed: " + message)
       }
     } finally {
+      clearTimeout(timeoutId)
       setSyncing(false)
     }
   }

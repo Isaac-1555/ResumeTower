@@ -19,9 +19,7 @@ import { PDFDocument, StandardFonts } from "pdf-lib";
 const PORT = Number(process.env.POLLER_PORT || 54350);
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "http://127.0.0.1:54321";
-const SUPABASE_SERVICE_ROLE_KEY =
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const IMAP_SECRET_KEY = process.env.IMAP_SECRET_KEY || "";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
@@ -29,9 +27,12 @@ const MAX_EMAILS_PER_SYNC = Number(process.env.MAX_EMAILS_PER_SYNC || 50);
 const MAX_LINKS_PER_EMAIL = Number(process.env.MAX_LINKS_PER_EMAIL || 20);
 const MAX_EMAIL_TEXT_CHARS = Number(process.env.MAX_EMAIL_TEXT_CHARS || 24000);
 const MAX_DESCRIPTION_CHARS = Number(process.env.MAX_DESCRIPTION_CHARS || 8000);
-const IMAP_SOCKET_TIMEOUT_MS = Number(process.env.IMAP_SOCKET_TIMEOUT_MS || 1800000);
+const IMAP_SOCKET_TIMEOUT_MS = Number(process.env.IMAP_SOCKET_TIMEOUT_MS || 60000);
+const IMAP_GREETING_TIMEOUT_MS = Number(process.env.IMAP_GREETING_TIMEOUT_MS || 15000);
+const POLL_TIMEOUT_MS = Number(process.env.POLL_TIMEOUT_MS || 180000);
 
 const DEFAULT_KEYWORDS = ["job", "hiring", "application"];
+let pollRunning = false;
 const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
 
 const EXTRACTION_SCHEMA = {
@@ -688,6 +689,94 @@ function buildJobFingerprint(emailId, opportunity) {
 }
 
 // ---------------------------------------------------------------------------
+// IMAP helpers for short-lived connections
+// ---------------------------------------------------------------------------
+async function createImapClient(imapHost, imapPort, imapUser, password) {
+  const client = new ImapFlow({
+    host: imapHost,
+    port: imapPort || 993,
+    secure: true,
+    auth: { user: imapUser, pass: password },
+    logger: false,
+    disableAutoIdle: true,
+    socketTimeout: IMAP_SOCKET_TIMEOUT_MS,
+    greetingTimeout: IMAP_GREETING_TIMEOUT_MS,
+  });
+  client.on("error", (imapErr) => {
+    console.error(`IMAP client error:`, imapErr?.message || imapErr);
+  });
+  return client;
+}
+
+async function closeImapClient(client) {
+  try {
+    await client.logout();
+  } catch {
+    try { client.close(); } catch { /* ignore */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Fetch all unread messages (short IMAP connection)
+// ---------------------------------------------------------------------------
+async function imapFetchUnread(imapHost, imapPort, imapUser, password) {
+  const client = await createImapClient(imapHost, imapPort, imapUser, password);
+  const fetched = [];
+
+  await client.connect();
+  try {
+    const lock = await client.getMailboxLock("INBOX");
+    try {
+      const allUids = await client.search({ seen: false }, { uid: true });
+      const uids = allUids.slice(-MAX_EMAILS_PER_SYNC);
+      console.log(`  Found ${allUids.length} unread message(s), fetching newest ${uids.length}.`);
+
+      for (const uid of uids) {
+        for await (const message of client.fetch(uid, {
+          uid: true,
+          envelope: true,
+          source: true,
+        }, { uid: true })) {
+          if (!message.source) continue;
+          const sourceBuffer = Buffer.isBuffer(message.source)
+            ? message.source
+            : Buffer.from(message.source);
+          fetched.push({ uid: message.uid, envelope: message.envelope, sourceBuffer });
+        }
+      }
+    } finally {
+      lock.release();
+    }
+  } finally {
+    await closeImapClient(client);
+  }
+
+  return fetched;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Mark messages as read (short IMAP connection)
+// ---------------------------------------------------------------------------
+async function imapMarkAsRead(imapHost, imapPort, imapUser, password, uidsToMark) {
+  if (uidsToMark.length === 0) return;
+
+  const client = await createImapClient(imapHost, imapPort, imapUser, password);
+  await client.connect();
+  try {
+    const lock = await client.getMailboxLock("INBOX");
+    try {
+      for (const uid of uidsToMark) {
+        await client.messageFlagsAdd(uid, ["\\Seen"], { uid: true });
+      }
+    } finally {
+      lock.release();
+    }
+  } finally {
+    await closeImapClient(client);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Poll handler
 // ---------------------------------------------------------------------------
 async function handlePoll() {
@@ -749,187 +838,165 @@ async function handlePoll() {
       const password = await decrypt(imap_password_encrypted, encryption_iv);
       const baseProfile = await fetchBaseProfile(supabase, user_id);
 
-      const client = new ImapFlow({
-        host: imap_host,
-        port: imap_port || 993,
-        secure: true,
-        auth: { user: imap_user, pass: password },
-        logger: false,
-        disableAutoIdle: true,
-        socketTimeout: IMAP_SOCKET_TIMEOUT_MS,
-      });
-      client.on("error", (imapErr) => {
-        console.error(`IMAP client error for user ${user_id}:`, imapErr);
-      });
+      // --- Phase 1: Fetch all unread messages (short IMAP connection) ---
+      console.log(`  Phase 1: Fetching unread emails from ${imap_host}...`);
+      const rawMessages = await imapFetchUnread(imap_host, imap_port, imap_user, password);
+      stats.emailsScanned += rawMessages.length;
+      console.log(`  Phase 1 done: fetched ${rawMessages.length} message(s). IMAP connection closed.`);
 
-      await client.connect();
-      try {
-        const lock = await client.getMailboxLock("INBOX");
+      // --- Phase 2: Process messages offline (no IMAP connection) ---
+      console.log(`  Phase 2: Processing messages...`);
+      const uidsToMark = [];
+
+      for (const raw of rawMessages) {
+        let emailContext;
         try {
-          const allUids = await client.search({ seen: false }, { uid: true });
-          // Process only the most recent messages to avoid timeouts
-          const uids = allUids.slice(-MAX_EMAILS_PER_SYNC);
-          console.log(`  Found ${allUids.length} unread message(s), processing newest ${uids.length}.`);
-
-          for (const uid of uids) {
-            for await (const message of client.fetch(uid, {
-              uid: true,
-              envelope: true,
-              source: true,
-            }, { uid: true })) {
-              stats.emailsScanned += 1;
-              if (!message.source) continue;
-
-              let emailContext;
-              try {
-                const sourceBuffer = Buffer.isBuffer(message.source)
-                  ? message.source
-                  : Buffer.from(message.source);
-                emailContext = await parseMessage(sourceBuffer, message);
-              } catch (err) {
-                errors.push(`Failed to parse message UID ${message.uid}: ${serializeError(err)}`);
-                continue;
-              }
-
-              const matches = keywordMatch(emailContext, keywords, matchInBody);
-              if (!matches) continue;
-              stats.emailsKeywordMatched += 1;
-
-              const opportunities = await extractOpportunitiesFromEmail(emailContext);
-              stats.opportunitiesExtracted += opportunities.length;
-              let messagePersisted = false;
-
-              for (const extracted of opportunities) {
-                const enriched = await enrichOpportunityWithUrls(extracted, emailContext.links);
-                const primaryUrl = enriched.apply_url || enriched.posting_url || emailContext.links[0]?.url || null;
-                const fingerprint = buildJobFingerprint(emailContext.messageId, enriched);
-
-                const { data: existingJob, error: existingError } = await supabase
-                  .from("jobs")
-                  .select("id")
-                  .eq("user_id", user_id)
-                  .eq("email_id", emailContext.messageId)
-                  .eq("job_fingerprint", fingerprint)
-                  .maybeSingle();
-
-                if (existingError) {
-                  errors.push(`Existing-job check failed for "${enriched.job_title}": ${serializeError(existingError)}`);
-                  continue;
-                }
-                if (existingJob) {
-                  stats.duplicateJobs += 1;
-                  messagePersisted = true;
-                  continue;
-                }
-
-                const jobData = {
-                  email_id: emailContext.messageId,
-                  user_id,
-                  job_fingerprint: fingerprint,
-                  job_title: normalizeString(enriched.job_title, emailContext.subject),
-                  company: normalizeString(
-                    enriched.company,
-                    normalizeString(emailContext.from.split("<")[0], emailContext.from),
-                  ),
-                  location: normalizeString(enriched.location, "Unknown"),
-                  description: truncate(
-                    normalizeString(enriched.description, emailContext.textBody || emailContext.subject),
-                    MAX_DESCRIPTION_CHARS,
-                  ),
-                  job_link: primaryUrl || `imap://${imap_host}/INBOX/${message.uid}`,
-                  posting_url: enriched.posting_url || primaryUrl,
-                  apply_url: enriched.apply_url || primaryUrl,
-                  source_subject: emailContext.subject,
-                  source_from: emailContext.from,
-                  source_received_at: emailContext.receivedAt,
-                  source_message_uid: message.uid,
-                  source_links: emailContext.links,
-                  status: "prepared",
-                  extracted_skills: normalizeStringArray(enriched.required_skills, 60),
-                  extraction_model: GEMINI_MODEL,
-                  extraction_confidence: enriched.confidence,
-                  extraction_raw: {
-                    extraction: extracted.raw || null,
-                    enrichment_status: enriched.enrichment_status || null,
-                    enrichment_error: enriched.enrichment_error || null,
-                    url_context_metadata: enriched.url_context_metadata || null,
-                  },
-                  parse_status:
-                    enriched.enrichment_status === "error"
-                      ? "partial"
-                      : "parsed",
-                  parse_error: enriched.enrichment_error || null,
-                };
-
-                const { data: insertedJob, error: insertError } = await supabase
-                  .from("jobs")
-                  .insert(jobData)
-                  .select()
-                  .single();
-
-                if (insertError) {
-                  errors.push(`Job insert failed for "${jobData.job_title}": ${serializeError(insertError)}`);
-                  continue;
-                }
-
-                stats.jobsInserted += 1;
-                processedJobs.push(insertedJob);
-                messagePersisted = true;
-
-                try {
-                  const resumeGeneration = await generateTailoredResume(baseProfile, {
-                    ...enriched,
-                    ...insertedJob,
-                  });
-                  const pdfBytes = await renderResumePdf(
-                    {
-                      job_title: insertedJob.job_title,
-                      company: insertedJob.company,
-                      location: insertedJob.location,
-                    },
-                    resumeGeneration.resume_json,
-                  );
-                  const resumePdfUrl = await uploadResumePdf(
-                    supabase,
-                    user_id,
-                    insertedJob.id,
-                    pdfBytes,
-                  );
-
-                  const { error: resumeInsertError } = await supabase
-                    .from("resumes")
-                    .insert({
-                      job_id: insertedJob.id,
-                      user_id,
-                      resume_json: resumeGeneration.resume_json,
-                      resume_pdf_url: resumePdfUrl,
-                    });
-
-                  if (resumeInsertError) {
-                    throw resumeInsertError;
-                  }
-                  stats.resumesGenerated += 1;
-                } catch (resumeErr) {
-                  stats.resumesFailed += 1;
-                  errors.push(
-                    `Resume generation failed for "${jobData.job_title}": ${serializeError(resumeErr)}`,
-                  );
-                }
-              }
-
-              if (messagePersisted) {
-                await client.messageFlagsAdd(message.uid, ["\\Seen"], { uid: true });
-              }
-            }
-          }
-        } finally {
-          lock.release();
+          emailContext = await parseMessage(raw.sourceBuffer, { uid: raw.uid, envelope: raw.envelope });
+        } catch (err) {
+          errors.push(`Failed to parse message UID ${raw.uid}: ${serializeError(err)}`);
+          continue;
         }
-      } finally {
+
+        const matches = keywordMatch(emailContext, keywords, matchInBody);
+        if (!matches) continue;
+        stats.emailsKeywordMatched += 1;
+
+        const opportunities = await extractOpportunitiesFromEmail(emailContext);
+        stats.opportunitiesExtracted += opportunities.length;
+        let messagePersisted = false;
+
+        for (const extracted of opportunities) {
+          const enriched = await enrichOpportunityWithUrls(extracted, emailContext.links);
+          const primaryUrl = enriched.apply_url || enriched.posting_url || emailContext.links[0]?.url || null;
+          const fingerprint = buildJobFingerprint(emailContext.messageId, enriched);
+
+          const { data: existingJob, error: existingError } = await supabase
+            .from("jobs")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("email_id", emailContext.messageId)
+            .eq("job_fingerprint", fingerprint)
+            .maybeSingle();
+
+          if (existingError) {
+            errors.push(`Existing-job check failed for "${enriched.job_title}": ${serializeError(existingError)}`);
+            continue;
+          }
+          if (existingJob) {
+            stats.duplicateJobs += 1;
+            messagePersisted = true;
+            continue;
+          }
+
+          const jobData = {
+            email_id: emailContext.messageId,
+            user_id,
+            job_fingerprint: fingerprint,
+            job_title: normalizeString(enriched.job_title, emailContext.subject),
+            company: normalizeString(
+              enriched.company,
+              normalizeString(emailContext.from.split("<")[0], emailContext.from),
+            ),
+            location: normalizeString(enriched.location, "Unknown"),
+            description: truncate(
+              normalizeString(enriched.description, emailContext.textBody || emailContext.subject),
+              MAX_DESCRIPTION_CHARS,
+            ),
+            job_link: primaryUrl || `imap://${imap_host}/INBOX/${raw.uid}`,
+            posting_url: enriched.posting_url || primaryUrl,
+            apply_url: enriched.apply_url || primaryUrl,
+            source_subject: emailContext.subject,
+            source_from: emailContext.from,
+            source_received_at: emailContext.receivedAt,
+            source_message_uid: raw.uid,
+            source_links: emailContext.links,
+            status: "prepared",
+            extracted_skills: normalizeStringArray(enriched.required_skills, 60),
+            extraction_model: GEMINI_MODEL,
+            extraction_confidence: enriched.confidence,
+            extraction_raw: {
+              extraction: extracted.raw || null,
+              enrichment_status: enriched.enrichment_status || null,
+              enrichment_error: enriched.enrichment_error || null,
+              url_context_metadata: enriched.url_context_metadata || null,
+            },
+            parse_status:
+              enriched.enrichment_status === "error"
+                ? "partial"
+                : "parsed",
+            parse_error: enriched.enrichment_error || null,
+          };
+
+          const { data: insertedJob, error: insertError } = await supabase
+            .from("jobs")
+            .insert(jobData)
+            .select()
+            .single();
+
+          if (insertError) {
+            errors.push(`Job insert failed for "${jobData.job_title}": ${serializeError(insertError)}`);
+            continue;
+          }
+
+          stats.jobsInserted += 1;
+          processedJobs.push(insertedJob);
+          messagePersisted = true;
+
+          try {
+            const resumeGeneration = await generateTailoredResume(baseProfile, {
+              ...enriched,
+              ...insertedJob,
+            });
+            const pdfBytes = await renderResumePdf(
+              {
+                job_title: insertedJob.job_title,
+                company: insertedJob.company,
+                location: insertedJob.location,
+              },
+              resumeGeneration.resume_json,
+            );
+            const resumePdfUrl = await uploadResumePdf(
+              supabase,
+              user_id,
+              insertedJob.id,
+              pdfBytes,
+            );
+
+            const { error: resumeInsertError } = await supabase
+              .from("resumes")
+              .insert({
+                job_id: insertedJob.id,
+                user_id,
+                resume_json: resumeGeneration.resume_json,
+                resume_pdf_url: resumePdfUrl,
+              });
+
+            if (resumeInsertError) {
+              throw resumeInsertError;
+            }
+            stats.resumesGenerated += 1;
+          } catch (resumeErr) {
+            stats.resumesFailed += 1;
+            errors.push(
+              `Resume generation failed for "${jobData.job_title}": ${serializeError(resumeErr)}`,
+            );
+          }
+        }
+
+        if (messagePersisted) {
+          uidsToMark.push(raw.uid);
+        }
+      }
+      console.log(`  Phase 2 done: ${stats.jobsInserted} job(s) inserted, ${uidsToMark.length} message(s) to mark read.`);
+
+      // --- Phase 3: Mark processed messages as read (short IMAP connection) ---
+      if (uidsToMark.length > 0) {
+        console.log(`  Phase 3: Marking ${uidsToMark.length} message(s) as read...`);
         try {
-          await client.logout();
-        } catch {
-          client.close();
+          await imapMarkAsRead(imap_host, imap_port, imap_user, password, uidsToMark);
+          console.log(`  Phase 3 done.`);
+        } catch (markErr) {
+          errors.push(`Failed to mark messages as read: ${serializeError(markErr)}`);
         }
       }
     } catch (err) {
@@ -972,15 +1039,32 @@ const server = http.createServer(async (req, res) => {
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
+  // Health check
+  if (url.pathname === "/health") {
+    res.writeHead(200, { ...CORS, "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, pollRunning }));
+  }
+
   if (url.pathname === "/poll" && req.method === "POST") {
+    if (pollRunning) {
+      res.writeHead(409, { ...CORS, "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "A sync is already in progress. Please wait for it to finish." }));
+    }
+
+    pollRunning = true;
     try {
-      const result = await handlePoll();
+      const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Poll timed out — the IMAP server may be unreachable or slow. Check your IMAP host/port/credentials.")), POLL_TIMEOUT_MS),
+      );
+      const result = await Promise.race([handlePoll(), timeout]);
       res.writeHead(result.status, { ...CORS, "Content-Type": "application/json" });
       return res.end(JSON.stringify(result.body));
     } catch (err) {
       console.error("Poll error:", err);
       res.writeHead(500, { ...CORS, "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: err.message }));
+    } finally {
+      pollRunning = false;
     }
   }
 
