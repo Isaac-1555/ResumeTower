@@ -1,0 +1,12 @@
+{
+  "name": "resumetower-poller",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node imap-poller-server.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2",
+    "imapflow": "^1"
+  }
+}
