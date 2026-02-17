@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
+import { Link } from "react-router-dom"
 import { supabase } from "@/lib/supabase"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -7,107 +8,125 @@ import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Search, Filter, Download, ExternalLink, Briefcase } from "lucide-react"
-import { Link } from "react-router-dom"
 
-// Mock Data
-const MOCK_JOBS = [
-  {
-    id: "1",
-    job_title: "Senior React Developer",
-    company: "TechCorp",
-    location: "Remote",
-    matchScore: 92,
-    status: "prepared",
-    created_at: "2023-10-25T12:00:00Z",
-  },
-  {
-    id: "2",
-    job_title: "Frontend Engineer",
-    company: "StartupInc",
-    location: "New York, NY",
-    matchScore: 85,
-    status: "applied",
-    created_at: "2023-10-24T12:00:00Z",
-  },
-  {
-    id: "3",
-    job_title: "Full Stack Developer",
-    company: "Enterprise Solutions",
-    location: "San Francisco, CA",
-    matchScore: 78,
-    status: "rejected",
-    created_at: "2023-10-20T12:00:00Z",
-  },
-  {
-    id: "4",
-    job_title: "Software Engineer",
-    company: "Google",
-    location: "Mountain View, CA",
-    matchScore: 95,
-    status: "interview",
-    created_at: "2023-10-22T12:00:00Z",
-  },
-]
+type JobStatus = "prepared" | "applied" | "interview" | "rejected"
+
+type ResumeRow = {
+  resume_pdf_url?: string | null
+  created_at?: string | null
+}
+
 type JobRow = {
   id: string
-  job_title?: string
-  company?: string
-  location?: string
-  matchScore: number
+  job_title?: string | null
+  company?: string | null
+  location?: string | null
   status: string
-  created_at?: string
-  job_link?: string
+  created_at?: string | null
+  job_link?: string | null
+  posting_url?: string | null
+  apply_url?: string | null
+  extracted_skills?: string[] | null
+  resumes?: ResumeRow[] | null
+  matchScore: number
+  latest_resume_pdf_url?: string | null
+}
+
+const STATUS_TABS: Array<{ label: string; value: string }> = [
+  { label: "Prepared", value: "prepared" },
+  { label: "Applied", value: "applied" },
+  { label: "Interviews", value: "interview" },
+  { label: "Rejected", value: "rejected" },
+  { label: "All Jobs", value: "all" },
+]
+
+const normalizeStatus = (value: string): JobStatus | "unknown" => {
+  if (value === "prepared" || value === "applied" || value === "interview" || value === "rejected") {
+    return value
+  }
+  return "unknown"
+}
+
+const computeMatchScore = (skills: unknown): number => {
+  if (!Array.isArray(skills)) return 78
+  const count = skills.filter((skill) => typeof skill === "string" && skill.trim().length > 0).length
+  return Math.min(99, 70 + count * 4)
+}
+
+const getLatestResumePdfUrl = (resumes: ResumeRow[] | null | undefined): string | null => {
+  if (!Array.isArray(resumes) || resumes.length === 0) return null
+  const sorted = [...resumes].sort((a, b) => {
+    const aTs = a.created_at ? new Date(a.created_at).getTime() : 0
+    const bTs = b.created_at ? new Date(b.created_at).getTime() : 0
+    return bTs - aTs
+  })
+  return sorted[0]?.resume_pdf_url || null
+}
+
+const getOutboundJobLink = (job: JobRow): string | null => {
+  return job.apply_url || job.posting_url || job.job_link || null
 }
 
 export default function Dashboard() {
   const [searchTerm, setSearchTerm] = useState("")
   const [activeTab, setActiveTab] = useState("prepared")
-  const [jobs, setJobs] = useState<JobRow[]>(MOCK_JOBS)
+  const [jobs, setJobs] = useState<JobRow[]>([])
 
   useEffect(() => {
     async function fetchJobs() {
-      // Check if Supabase env vars are set properly
-      if (!import.meta.env.VITE_SUPABASE_URL || !import.meta.env.VITE_SUPABASE_ANON_KEY) return;
-      
+      if (!import.meta.env.VITE_SUPABASE_URL || !import.meta.env.VITE_SUPABASE_ANON_KEY) return
+
       const { data, error } = await supabase
-        .from('jobs')
-        .select('*')
-        .order('created_at', { ascending: false });
-      
-      if (data) {
-          const jobsWithScore = data.map(job => ({
-              ...job,
-              matchScore: Math.floor(Math.random() * 20) + 80 // Mock score between 80-100
-          }))
-          setJobs(jobsWithScore);
+        .from("jobs")
+        .select("*, resumes(resume_pdf_url, created_at)")
+        .order("created_at", { ascending: false })
+
+      if (error) {
+        console.error("Error fetching jobs:", error)
+        return
       }
-      if (error) console.error("Error fetching jobs:", error);
+
+      const normalized: JobRow[] = (data || []).map((job) => ({
+        ...job,
+        matchScore: computeMatchScore(job.extracted_skills),
+        latest_resume_pdf_url: getLatestResumePdfUrl(job.resumes),
+      }))
+      setJobs(normalized)
     }
-    fetchJobs();
+
+    fetchJobs()
   }, [])
 
-  const filteredJobs = jobs.filter(job => 
-    (activeTab === "all" || job.status === activeTab) &&
-    ((job.job_title?.toLowerCase() || "").includes(searchTerm.toLowerCase()) || 
-     (job.company?.toLowerCase() || "").includes(searchTerm.toLowerCase()))
-  )
-// ... rest of the file using job.job_title instead of job.title, etc.
-
+  const filteredJobs = useMemo(() => {
+    const needle = searchTerm.toLowerCase()
+    return jobs.filter((job) => {
+      const matchesTab = activeTab === "all" || job.status === activeTab
+      const title = (job.job_title || "").toLowerCase()
+      const company = (job.company || "").toLowerCase()
+      const matchesSearch = title.includes(needle) || company.includes(needle)
+      return matchesTab && matchesSearch
+    })
+  }, [jobs, activeTab, searchTerm])
 
   const getStatusBadge = (status: string) => {
-    switch (status) {
-      case "prepared": return <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200">Prepared</Badge>
-      case "applied": return <Badge variant="outline" className="bg-yellow-50 text-yellow-700 border-yellow-200">Applied</Badge>
-      case "interview": return <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200">Interview</Badge>
-      case "rejected": return <Badge variant="outline" className="bg-red-50 text-red-700 border-red-200">Rejected</Badge>
-      default: return <Badge variant="outline">Unknown</Badge>
+    switch (normalizeStatus(status)) {
+      case "prepared":
+        return <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200">Prepared</Badge>
+      case "applied":
+        return <Badge variant="outline" className="bg-yellow-50 text-yellow-700 border-yellow-200">Applied</Badge>
+      case "interview":
+        return <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200">Interview</Badge>
+      case "rejected":
+        return <Badge variant="outline" className="bg-red-50 text-red-700 border-red-200">Rejected</Badge>
+      default:
+        return <Badge variant="outline">Unknown</Badge>
     }
   }
 
-  const preparedCount = jobs.filter((j) => j.status === "prepared").length
-  const appliedCount = jobs.filter((j) => j.status === "applied").length
-  const interviewCount = jobs.filter((j) => j.status === "interview").length
-  const rejectedCount = jobs.filter((j) => j.status === "rejected").length
+  const preparedCount = jobs.filter((job) => job.status === "prepared").length
+  const appliedCount = jobs.filter((job) => job.status === "applied").length
+  const interviewCount = jobs.filter((job) => job.status === "interview").length
+  const rejectedCount = jobs.filter((job) => job.status === "rejected").length
 
   return (
     <div className="space-y-6">
@@ -152,21 +171,19 @@ export default function Dashboard() {
             placeholder="Search jobs..."
             className="pl-8"
             value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
+            onChange={(event) => setSearchTerm(event.target.value)}
           />
         </div>
-        <Button variant="outline" size="icon" className="rounded-xl">
-            <Filter className="h-4 w-4" />
+        <Button variant="outline" size="icon" className="rounded-xl" type="button" disabled>
+          <Filter className="h-4 w-4" />
         </Button>
       </div>
 
       <Tabs defaultValue="prepared" className="space-y-4" onValueChange={setActiveTab}>
         <TabsList className="rounded-xl w-full justify-start overflow-x-auto whitespace-nowrap">
-          <TabsTrigger value="prepared">Prepared</TabsTrigger>
-          <TabsTrigger value="applied">Applied</TabsTrigger>
-          <TabsTrigger value="interview">Interviews</TabsTrigger>
-          <TabsTrigger value="rejected">Rejected</TabsTrigger>
-          <TabsTrigger value="all">All Jobs</TabsTrigger>
+          {STATUS_TABS.map((tab) => (
+            <TabsTrigger key={tab.value} value={tab.value}>{tab.label}</TabsTrigger>
+          ))}
         </TabsList>
 
         <TabsContent value={activeTab} className="space-y-4">
@@ -183,31 +200,53 @@ export default function Dashboard() {
               ) : (
                 <>
                   <div className="md:hidden space-y-3">
-                    {filteredJobs.map((job) => (
-                      <Card key={job.id} className="rounded-xl border">
-                        <CardContent className="p-4 space-y-3">
-                          <div className="flex items-start justify-between gap-3">
-                            <div>
-                              <p className="font-medium leading-tight">{job.job_title}</p>
-                              <p className="text-sm text-muted-foreground">{job.company} • {job.location}</p>
+                    {filteredJobs.map((job) => {
+                      const outboundLink = getOutboundJobLink(job)
+                      const resumePdfUrl = job.latest_resume_pdf_url
+                      return (
+                        <Card key={job.id} className="rounded-xl border">
+                          <CardContent className="p-4 space-y-3">
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <p className="font-medium leading-tight">{job.job_title || "Untitled role"}</p>
+                                <p className="text-sm text-muted-foreground">{job.company || "Unknown company"} • {job.location || "Unknown"}</p>
+                              </div>
+                              <Badge variant={job.matchScore > 80 ? "default" : "secondary"}>
+                                {job.matchScore}%
+                              </Badge>
                             </div>
-                            <Badge variant={job.matchScore > 80 ? "default" : "secondary"}>
-                              {job.matchScore}%
-                            </Badge>
-                          </div>
-                          <div>{getStatusBadge(job.status)}</div>
-                          <div className="flex items-center gap-2">
-                            <Button asChild variant="outline" size="sm" className="rounded-lg">
-                              <Link to={`/job/${job.id}`}>Open</Link>
-                            </Button>
-                            <Button variant="outline" size="sm" className="rounded-lg" onClick={() => window.open(job.job_link || `/job/${job.id}`, "_blank")}>
-                              <ExternalLink className="h-4 w-4 mr-1" />
-                              Source
-                            </Button>
-                          </div>
-                        </CardContent>
-                      </Card>
-                    ))}
+                            <div>{getStatusBadge(job.status)}</div>
+                            <div className="flex items-center gap-2">
+                              <Button asChild variant="outline" size="sm" className="rounded-lg">
+                                <Link to={`/job/${job.id}`}>Open</Link>
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="rounded-lg"
+                                type="button"
+                                disabled={!outboundLink}
+                                onClick={() => outboundLink && window.open(outboundLink, "_blank", "noopener,noreferrer")}
+                              >
+                                <ExternalLink className="h-4 w-4 mr-1" />
+                                Apply
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="rounded-lg"
+                                type="button"
+                                disabled={!resumePdfUrl}
+                                onClick={() => resumePdfUrl && window.open(resumePdfUrl, "_blank", "noopener,noreferrer")}
+                              >
+                                <Download className="h-4 w-4 mr-1" />
+                                Resume
+                              </Button>
+                            </div>
+                          </CardContent>
+                        </Card>
+                      )
+                    })}
                   </div>
 
                   <div className="hidden md:block">
@@ -223,34 +262,52 @@ export default function Dashboard() {
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {filteredJobs.map((job) => (
-                          <TableRow key={job.id}>
-                            <TableCell className="font-medium">
+                        {filteredJobs.map((job) => {
+                          const outboundLink = getOutboundJobLink(job)
+                          const resumePdfUrl = job.latest_resume_pdf_url
+                          return (
+                            <TableRow key={job.id}>
+                              <TableCell className="font-medium">
                                 <div className="flex items-center space-x-2">
-                                    <Briefcase className="h-4 w-4 text-muted-foreground" />
-                                    <Link to={`/job/${job.id}`} className="hover:underline">
-                                        <span>{job.job_title}</span>
-                                    </Link>
+                                  <Briefcase className="h-4 w-4 text-muted-foreground" />
+                                  <Link to={`/job/${job.id}`} className="hover:underline">
+                                    <span>{job.job_title || "Untitled role"}</span>
+                                  </Link>
                                 </div>
-                            </TableCell>
-                            <TableCell>{job.company}</TableCell>
-                            <TableCell>{job.location}</TableCell>
-                            <TableCell>
+                              </TableCell>
+                              <TableCell>{job.company || "Unknown company"}</TableCell>
+                              <TableCell>{job.location || "Unknown"}</TableCell>
+                              <TableCell>
                                 <Badge variant={job.matchScore > 80 ? "default" : "secondary"}>
-                                    {job.matchScore}%
+                                  {job.matchScore}%
                                 </Badge>
-                            </TableCell>
-                            <TableCell>{getStatusBadge(job.status)}</TableCell>
-                            <TableCell className="text-right space-x-2">
-                              <Button variant="ghost" size="icon" title="View Job" onClick={() => window.open(job.job_link || `/job/${job.id}`, '_blank')}>
-                                <ExternalLink className="h-4 w-4" />
-                              </Button>
-                              <Button variant="ghost" size="icon" title="Download Resume">
-                                <Download className="h-4 w-4" />
-                              </Button>
-                            </TableCell>
-                          </TableRow>
-                        ))}
+                              </TableCell>
+                              <TableCell>{getStatusBadge(job.status)}</TableCell>
+                              <TableCell className="text-right space-x-2">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  title="Open apply/source link"
+                                  type="button"
+                                  disabled={!outboundLink}
+                                  onClick={() => outboundLink && window.open(outboundLink, "_blank", "noopener,noreferrer")}
+                                >
+                                  <ExternalLink className="h-4 w-4" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  title="Download resume PDF"
+                                  type="button"
+                                  disabled={!resumePdfUrl}
+                                  onClick={() => resumePdfUrl && window.open(resumePdfUrl, "_blank", "noopener,noreferrer")}
+                                >
+                                  <Download className="h-4 w-4" />
+                                </Button>
+                              </TableCell>
+                            </TableRow>
+                          )
+                        })}
                       </TableBody>
                     </Table>
                   </div>

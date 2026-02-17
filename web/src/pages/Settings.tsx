@@ -139,16 +139,49 @@ export default function Settings() {
         const body = await res.json().catch(() => null)
         throw new Error(body?.error || `Server returned ${res.status}`)
       }
-      const payload = (await res.json()) as { jobs?: unknown[]; errors?: string[] }
+      const payload = (await res.json()) as {
+        jobs?: unknown[]
+        errors?: string[]
+        stats?: {
+          integrationsFound?: number
+          emailsScanned?: number
+          emailsKeywordMatched?: number
+          opportunitiesExtracted?: number
+          jobsInserted?: number
+          duplicateJobs?: number
+          resumesGenerated?: number
+          resumesFailed?: number
+        }
+      }
       const jobsProcessed = Array.isArray(payload?.jobs) ? payload.jobs.length : 0
       const backendErrors = Array.isArray(payload?.errors) ? payload.errors : []
+      const stats = payload?.stats
+      const statsSummary = stats
+        ? [
+            `Integrations: ${stats.integrationsFound ?? 0}`,
+            `Emails scanned: ${stats.emailsScanned ?? 0}`,
+            `Keyword matches: ${stats.emailsKeywordMatched ?? 0}`,
+            `Opportunities extracted: ${stats.opportunitiesExtracted ?? 0}`,
+            `Jobs inserted: ${stats.jobsInserted ?? 0}`,
+            `Duplicates skipped: ${stats.duplicateJobs ?? 0}`,
+            `Resumes generated: ${stats.resumesGenerated ?? 0}`,
+            `Resume failures: ${stats.resumesFailed ?? 0}`,
+          ].join("\n")
+        : null
 
       if (backendErrors.length > 0) {
-        alert("Sync error:\n\n" + backendErrors.join("\n"))
+        alert(
+          "Sync completed with errors:\n\n" +
+            backendErrors.join("\n") +
+            (statsSummary ? `\n\n${statsSummary}` : ""),
+        )
       } else if (jobsProcessed > 0) {
-        alert(`Sync complete: imported ${jobsProcessed} new job${jobsProcessed === 1 ? "" : "s"}.`)
+        alert(
+          `Sync complete: imported ${jobsProcessed} new job${jobsProcessed === 1 ? "" : "s"}.` +
+            (statsSummary ? `\n\n${statsSummary}` : ""),
+        )
       } else {
-        alert("Sync complete: no new matching unread emails found.")
+        alert("Sync complete: no new matching unread emails found." + (statsSummary ? `\n\n${statsSummary}` : ""))
       }
     } catch (err) {
       console.error(err)

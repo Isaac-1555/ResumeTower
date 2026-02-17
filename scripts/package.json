@@ -6,7 +6,10 @@
     "start": "node imap-poller-server.mjs"
   },
   "dependencies": {
+    "@google/genai": "^1.32.0",
     "@supabase/supabase-js": "^2",
-    "imapflow": "^1"
+    "imapflow": "^1",
+    "mailparser": "^3.9.0",
+    "pdf-lib": "^1.17.1"
   }
 }
