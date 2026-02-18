@@ -14,13 +14,16 @@ const DEFAULT_JOB_KEYWORDS = ["job", "hiring", "application"]
 export default function Settings() {
   const [loading, setLoading] = useState(false)
   const [syncing, setSyncing] = useState(false)
+  const [syncingAll, setSyncingAll] = useState(false)
   const [savingKeywordFilters, setSavingKeywordFilters] = useState(false)
+  const [savingSyncSettings, setSavingSyncSettings] = useState(false)
   const [imapConfig, setImapConfig] = useState({
     host: "",
     port: 993,
     username: "",
     password: "",
   })
+  const [maxEmailsPerSync, setMaxEmailsPerSync] = useState(10)
   const [keywordConfig, setKeywordConfig] = useState<{
     keywordsText: string
     matchScope: KeywordMatchScope
@@ -36,14 +39,35 @@ export default function Settings() {
     const checkIntegration = async () => {
         const { data } = await supabase
           .from('user_integrations')
-          .select('imap_host, job_keywords, keyword_match_scope')
+          .select('imap_host, job_keywords, keyword_match_scope, max_emails_per_sync')
           .eq('user_id', APP_USER_ID)
           .maybeSingle();
 
-        if (!data) return;
+        if (!data) {
+          const cached = localStorage.getItem("imap_config_cache");
+          if (cached) {
+            try {
+              const parsed = JSON.parse(cached);
+              setImapConfig({
+                host: parsed.host || "",
+                port: Number(parsed.port) || 993,
+                username: parsed.username || "",
+                password: parsed.password || ""
+              });
+            } catch (e) {
+              console.error("Failed to parse cached config", e);
+            }
+          }
+          return;
+        }
+
         if (data.imap_host) {
           setStatus("connected");
           setImapConfig(prev => ({ ...prev, host: data.imap_host }));
+        }
+
+        if (typeof data.max_emails_per_sync === "number" && data.max_emails_per_sync > 0) {
+          setMaxEmailsPerSync(data.max_emails_per_sync);
         }
 
         const keywords = Array.isArray(data.job_keywords) && data.job_keywords.length > 0
@@ -209,6 +233,111 @@ export default function Settings() {
     }
   }
 
+  const handleSyncAll = async () => {
+    setSyncingAll(true)
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 300_000) // 5 min for full sync
+    try {
+      try {
+        const health = await fetch("http://localhost:54350/health", { signal: AbortSignal.timeout(3000) })
+        if (!health.ok) throw new Error("unhealthy")
+      } catch {
+        throw new Error(
+          "Could not reach the poller server.\n\nIt should start automatically when you run `npm run dev` in `web/`.\nTry restarting the dev server.",
+        )
+      }
+
+      const res = await fetch("http://localhost:54350/poll", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ syncAll: true }),
+        signal: controller.signal,
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => null)
+        throw new Error(body?.error || `Server returned ${res.status}`)
+      }
+      const payload = (await res.json()) as {
+        jobs?: unknown[]
+        errors?: string[]
+        stats?: {
+          integrationsFound?: number
+          emailsScanned?: number
+          emailsKeywordMatched?: number
+          opportunitiesExtracted?: number
+          jobsInserted?: number
+          duplicateJobs?: number
+          resumesGenerated?: number
+          resumesFailed?: number
+        }
+      }
+      const jobsProcessed = Array.isArray(payload?.jobs) ? payload.jobs.length : 0
+      const backendErrors = Array.isArray(payload?.errors) ? payload.errors : []
+      const stats = payload?.stats
+      const statsSummary = stats
+        ? [
+            `Integrations: ${stats.integrationsFound ?? 0}`,
+            `Emails scanned: ${stats.emailsScanned ?? 0}`,
+            `Keyword matches: ${stats.emailsKeywordMatched ?? 0}`,
+            `Opportunities extracted: ${stats.opportunitiesExtracted ?? 0}`,
+            `Jobs inserted: ${stats.jobsInserted ?? 0}`,
+            `Duplicates skipped: ${stats.duplicateJobs ?? 0}`,
+            `Resumes generated: ${stats.resumesGenerated ?? 0}`,
+            `Resume failures: ${stats.resumesFailed ?? 0}`,
+          ].join("\n")
+        : null
+
+      if (backendErrors.length > 0) {
+        alert(
+          "Full sync completed with errors:\n\n" +
+            backendErrors.join("\n") +
+            (statsSummary ? `\n\n${statsSummary}` : ""),
+        )
+      } else if (jobsProcessed > 0) {
+        alert(
+          `Full sync complete: imported ${jobsProcessed} new job${jobsProcessed === 1 ? "" : "s"}.` +
+            (statsSummary ? `\n\n${statsSummary}` : ""),
+        )
+      } else {
+        alert("Full sync complete: no new matching unread emails found." + (statsSummary ? `\n\n${statsSummary}` : ""))
+      }
+    } catch (err) {
+      console.error(err)
+      const message = err instanceof Error ? err.message : "Unknown error"
+      if (controller.signal.aborted) {
+        alert("Sync timed out after 5 minutes. The poller may still be processing in the background.")
+      } else {
+        alert("Sync All failed: " + message)
+      }
+    } finally {
+      clearTimeout(timeoutId)
+      setSyncingAll(false)
+    }
+  }
+
+  const handleSaveSyncSettings = async () => {
+    setSavingSyncSettings(true)
+    try {
+      const value = Math.max(1, Math.min(1000, maxEmailsPerSync))
+      const { error } = await supabase
+        .from("user_integrations")
+        .upsert({
+          user_id: APP_USER_ID,
+          max_emails_per_sync: value,
+          updated_at: new Date().toISOString(),
+        }, { onConflict: "user_id" })
+
+      if (error) throw error
+      setMaxEmailsPerSync(value)
+      alert("Sync settings saved.")
+    } catch (err) {
+      console.error(err)
+      const message = err instanceof Error ? err.message : "Unknown error"
+      alert("Failed to save sync settings: " + message)
+    } finally {
+      setSavingSyncSettings(false)
+    }
+  }
 
   const handleSaveIntegration = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -225,6 +354,13 @@ export default function Settings() {
 
         if (error) throw error;
         
+        localStorage.setItem("imap_config_cache", JSON.stringify({
+            host: imapConfig.host,
+            port: Number(imapConfig.port),
+            username: imapConfig.username,
+            password: imapConfig.password
+        }));
+
         setStatus("connected");
         alert("Integration saved successfully!");
     } catch (err) {
@@ -355,6 +491,44 @@ export default function Settings() {
                     </Button>
                 </div>
             </form>
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-2xl shadow-sm">
+          <CardHeader>
+            <CardTitle>Sync Settings</CardTitle>
+            <CardDescription>Control how many emails are checked per sync and trigger a full sync of all unread emails.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="max-emails">Max emails per sync</Label>
+              <Input
+                id="max-emails"
+                type="number"
+                min={1}
+                max={1000}
+                value={maxEmailsPerSync}
+                onChange={(e) => setMaxEmailsPerSync(Number(e.target.value) || 10)}
+              />
+              <p className="text-xs text-muted-foreground">
+                The Sync Now button (on Dashboard and here) will check only the latest N unread emails. Default is 10.
+              </p>
+            </div>
+            <div className="flex items-center justify-between pt-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={handleSyncAll}
+                disabled={syncingAll || syncing || status !== "connected"}
+              >
+                <RefreshCw className={`mr-2 h-4 w-4 ${syncingAll ? "animate-spin" : ""}`} />
+                {syncingAll ? "Syncing All..." : "Sync All Emails"}
+              </Button>
+              <Button type="button" onClick={handleSaveSyncSettings} disabled={savingSyncSettings}>
+                <Save className="mr-2 h-4 w-4" />
+                {savingSyncSettings ? "Saving..." : "Save Sync Settings"}
+              </Button>
+            </div>
           </CardContent>
         </Card>
 

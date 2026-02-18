@@ -719,7 +719,7 @@ async function closeImapClient(client) {
 // ---------------------------------------------------------------------------
 // Phase 1: Fetch all unread messages (short IMAP connection)
 // ---------------------------------------------------------------------------
-async function imapFetchUnread(imapHost, imapPort, imapUser, password) {
+async function imapFetchUnread(imapHost, imapPort, imapUser, password, { maxEmails = MAX_EMAILS_PER_SYNC } = {}) {
   const client = await createImapClient(imapHost, imapPort, imapUser, password);
   const fetched = [];
 
@@ -727,9 +727,9 @@ async function imapFetchUnread(imapHost, imapPort, imapUser, password) {
   try {
     const lock = await client.getMailboxLock("INBOX");
     try {
-      const allUids = await client.search({ seen: false }, { uid: true });
-      const uids = allUids.slice(-MAX_EMAILS_PER_SYNC);
-      console.log(`  Found ${allUids.length} unread message(s), fetching newest ${uids.length}.`);
+      const allUids = await client.search({ seq: "1:*" }, { uid: true });
+      const uids = maxEmails > 0 ? allUids.slice(-maxEmails) : allUids;
+      console.log(`  Found ${allUids.length} total message(s), fetching newest ${uids.length} (limit: ${maxEmails > 0 ? maxEmails : "unlimited"}).`);
 
       for (const uid of uids) {
         for await (const message of client.fetch(uid, {
@@ -779,7 +779,7 @@ async function imapMarkAsRead(imapHost, imapPort, imapUser, password, uidsToMark
 // ---------------------------------------------------------------------------
 // Poll handler
 // ---------------------------------------------------------------------------
-async function handlePoll() {
+async function handlePoll({ syncAll = false } = {}) {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
   console.log("Polling IMAP for new jobs...");
@@ -827,7 +827,15 @@ async function handlePoll() {
       encryption_iv,
       job_keywords,
       keyword_match_scope,
+      max_emails_per_sync,
     } = integration;
+
+    // Determine effective email limit for this user
+    const effectiveMaxEmails = syncAll
+      ? 0 // 0 = unlimited
+      : (typeof max_emails_per_sync === "number" && max_emails_per_sync > 0
+          ? max_emails_per_sync
+          : 10); // default to 10
 
     const keywords = Array.isArray(job_keywords) && job_keywords.length > 0
       ? [...new Set(job_keywords.map((k) => String(k).trim().toLowerCase()).filter(Boolean))]
@@ -840,7 +848,7 @@ async function handlePoll() {
 
       // --- Phase 1: Fetch all unread messages (short IMAP connection) ---
       console.log(`  Phase 1: Fetching unread emails from ${imap_host}...`);
-      const rawMessages = await imapFetchUnread(imap_host, imap_port, imap_user, password);
+      const rawMessages = await imapFetchUnread(imap_host, imap_port, imap_user, password, { maxEmails: effectiveMaxEmails });
       stats.emailsScanned += rawMessages.length;
       console.log(`  Phase 1 done: fetched ${rawMessages.length} message(s). IMAP connection closed.`);
 
@@ -855,6 +863,22 @@ async function handlePoll() {
         } catch (err) {
           errors.push(`Failed to parse message UID ${raw.uid}: ${serializeError(err)}`);
           continue;
+        }
+
+        // Deduplication: if we already have jobs from this email_id, skip it.
+        // This avoids re-processing old emails that are fetched again.
+        const { count: existingEmailCount, error: existingEmailError } = await supabase
+          .from("jobs")
+          .select("*", { count: "exact", head: true })
+          .eq("user_id", user_id)
+          .eq("email_id", emailContext.messageId);
+
+        if (existingEmailError) {
+           console.warn(`  Warning: failed to check existing email_id ${emailContext.messageId}:`, existingEmailError.message);
+        } else if (existingEmailCount && existingEmailCount > 0) {
+           // We have already processed this email.
+           // console.log(`  Skipping already-processed email: ${emailContext.subject} (${emailContext.messageId})`);
+           continue;
         }
 
         const matches = keywordMatch(emailContext, keywords, matchInBody);
@@ -1051,12 +1075,24 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: "A sync is already in progress. Please wait for it to finish." }));
     }
 
+    // Parse request body for options (e.g. { syncAll: true })
+    let reqBody = {};
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const raw = Buffer.concat(chunks).toString();
+      if (raw.trim()) reqBody = JSON.parse(raw);
+    } catch {
+      // Ignore parse errors – treat as empty body (default sync)
+    }
+    const syncAll = reqBody?.syncAll === true;
+
     pollRunning = true;
     try {
       const timeout = new Promise((_, reject) =>
         setTimeout(() => reject(new Error("Poll timed out — the IMAP server may be unreachable or slow. Check your IMAP host/port/credentials.")), POLL_TIMEOUT_MS),
       );
-      const result = await Promise.race([handlePoll(), timeout]);
+      const result = await Promise.race([handlePoll({ syncAll }), timeout]);
       res.writeHead(result.status, { ...CORS, "Content-Type": "application/json" });
       return res.end(JSON.stringify(result.body));
     } catch (err) {
