@@ -8,13 +8,14 @@ import { Badge } from "@/components/ui/badge"
 import { RefreshCw, Save } from "lucide-react"
 import { supabase } from "@/lib/supabase"
 import { APP_USER_EMAIL, APP_USER_ID } from "@/lib/appUser"
+import { toast } from "sonner"
+import { useSyncContext } from "@/hooks/useSyncContext"
 type KeywordMatchScope = "subject" | "subject_or_body"
 const DEFAULT_JOB_KEYWORDS = ["job", "hiring", "application"]
 
 export default function Settings() {
   const [loading, setLoading] = useState(false)
-  const [syncing, setSyncing] = useState(false)
-  const [syncingAll, setSyncingAll] = useState(false)
+  const { syncing, progress, triggerSync } = useSyncContext()
   const [savingKeywordFilters, setSavingKeywordFilters] = useState(false)
   const [savingSyncSettings, setSavingSyncSettings] = useState(false)
   const [imapConfig, setImapConfig] = useState({
@@ -142,211 +143,25 @@ export default function Settings() {
               // I will attempt to select first to get the ID, then update, or insert if not found.
               
           if (error) throw error;
-          alert("Profile saved successfully!");
+          toast.success("Profile saved successfully!");
       } catch (err) {
           const message = err instanceof Error ? err.message : "Unknown error";
           if (message.includes("foreign key constraint")) {
-              alert("Profile save failed due to a database constraint issue. Re-apply migrations and try again.");
+              toast.error("Profile save failed due to a database constraint issue. Re-apply migrations and try again.");
           } else {
-              alert("Failed to save profile: " + message);
+              toast.error("Failed to save profile: " + message);
           }
       } finally {
           setLoading(false);
       }
   }
 
-  const handleSyncNow = async () => {
-    setSyncing(true)
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 180_000) // 3 min
-    try {
-      // Quick health check first
-      try {
-        const health = await fetch("http://localhost:54350/health", { signal: AbortSignal.timeout(3000) })
-        if (!health.ok) throw new Error("unhealthy")
-      } catch {
-        throw new Error(
-          "Could not reach the poller server.\n\nIt should start automatically when you run `npm run dev` in `web/`.\nTry restarting the dev server.",
-        )
-      }
-
-      const res = await fetch("http://localhost:54350/poll", { method: "POST", signal: controller.signal })
-
-      let payload: {
-        jobs?: unknown[]
-        errors?: string[]
-        stats?: {
-          integrationsFound?: number
-          emailsScanned?: number
-          emailsKeywordMatched?: number
-          opportunitiesExtracted?: number
-          jobsInserted?: number
-          duplicateJobs?: number
-          resumesGenerated?: number
-          resumesFailed?: number
-          running?: boolean
-        }
-      }
-      if (res.status === 202) {
-        while (true) {
-          await new Promise((resolve) => setTimeout(resolve, 1000))
-          if (controller.signal.aborted) throw new Error("Aborted")
-          const statusRes = await fetch("http://localhost:54350/status", { signal: controller.signal })
-          if (!statusRes.ok) throw new Error("Failed to check status")
-          const status = await statusRes.json()
-          if (!status.running) {
-            payload = { stats: status, jobs: [], errors: status.errors || [] }
-            break
-          }
-        }
-      } else if (!res.ok) {
-        const body = await res.json().catch(() => null)
-        throw new Error(body?.error || `Server returned ${res.status}`)
-      } else {
-        payload = await res.json()
-      }
-
-      const jobsProcessed = payload?.stats?.jobsInserted ?? (Array.isArray(payload?.jobs) ? payload.jobs.length : 0)
-      const backendErrors = Array.isArray(payload?.errors) ? payload.errors : []
-      const stats = payload?.stats
-      const statsSummary = stats
-        ? [
-            `Integrations: ${stats.integrationsFound ?? 0}`,
-            `Emails scanned: ${stats.emailsScanned ?? 0}`,
-            `Keyword matches: ${stats.emailsKeywordMatched ?? 0}`,
-            `Opportunities extracted: ${stats.opportunitiesExtracted ?? 0}`,
-            `Jobs inserted: ${stats.jobsInserted ?? 0}`,
-            `Duplicates skipped: ${stats.duplicateJobs ?? 0}`,
-            `Resumes generated: ${stats.resumesGenerated ?? 0}`,
-            `Resume failures: ${stats.resumesFailed ?? 0}`,
-          ].join("\n")
-        : null
-
-      if (backendErrors.length > 0) {
-        alert(
-          "Sync completed with errors:\n\n" +
-            backendErrors.join("\n") +
-            (statsSummary ? `\n\n${statsSummary}` : ""),
-        )
-      } else if (jobsProcessed > 0) {
-        alert(
-          `Sync complete: imported ${jobsProcessed} new job${jobsProcessed === 1 ? "" : "s"}.` +
-            (statsSummary ? `\n\n${statsSummary}` : ""),
-        )
-      } else {
-        alert("Sync complete: no new matching unread emails found." + (statsSummary ? `\n\n${statsSummary}` : ""))
-      }
-    } catch (err) {
-      console.error(err)
-      const message = err instanceof Error ? err.message : "Unknown error"
-      if (controller.signal.aborted) {
-        alert("Sync timed out after 3 minutes. The poller may still be processing in the background.")
-      } else {
-        alert("Sync failed: " + message)
-      }
-    } finally {
-      clearTimeout(timeoutId)
-      setSyncing(false)
-    }
+  const handleSyncNow = () => {
+    triggerSync()
   }
 
-  const handleSyncAll = async () => {
-    setSyncingAll(true)
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 300_000) // 5 min for full sync
-    try {
-      try {
-        const health = await fetch("http://localhost:54350/health", { signal: AbortSignal.timeout(3000) })
-        if (!health.ok) throw new Error("unhealthy")
-      } catch {
-        throw new Error(
-          "Could not reach the poller server.\n\nIt should start automatically when you run `npm run dev` in `web/`.\nTry restarting the dev server.",
-        )
-      }
-
-      const res = await fetch("http://localhost:54350/poll", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ syncAll: true }),
-        signal: controller.signal,
-      })
-
-      let payload: {
-        jobs?: unknown[]
-        errors?: string[]
-        stats?: {
-          integrationsFound?: number
-          emailsScanned?: number
-          emailsKeywordMatched?: number
-          opportunitiesExtracted?: number
-          jobsInserted?: number
-          duplicateJobs?: number
-          resumesGenerated?: number
-          resumesFailed?: number
-          running?: boolean
-        }
-      }
-      if (res.status === 202) {
-        while (true) {
-          await new Promise((resolve) => setTimeout(resolve, 1000))
-          if (controller.signal.aborted) throw new Error("Aborted")
-          const statusRes = await fetch("http://localhost:54350/status", { signal: controller.signal })
-          if (!statusRes.ok) throw new Error("Failed to check status")
-          const status = await statusRes.json()
-          if (!status.running) {
-            payload = { stats: status, jobs: [], errors: status.errors || [] }
-            break
-          }
-        }
-      } else if (!res.ok) {
-        const body = await res.json().catch(() => null)
-        throw new Error(body?.error || `Server returned ${res.status}`)
-      } else {
-        payload = await res.json()
-      }
-
-      const jobsProcessed = payload?.stats?.jobsInserted ?? (Array.isArray(payload?.jobs) ? payload.jobs.length : 0)
-      const backendErrors = Array.isArray(payload?.errors) ? payload.errors : []
-      const stats = payload?.stats
-      const statsSummary = stats
-        ? [
-            `Integrations: ${stats.integrationsFound ?? 0}`,
-            `Emails scanned: ${stats.emailsScanned ?? 0}`,
-            `Keyword matches: ${stats.emailsKeywordMatched ?? 0}`,
-            `Opportunities extracted: ${stats.opportunitiesExtracted ?? 0}`,
-            `Jobs inserted: ${stats.jobsInserted ?? 0}`,
-            `Duplicates skipped: ${stats.duplicateJobs ?? 0}`,
-            `Resumes generated: ${stats.resumesGenerated ?? 0}`,
-            `Resume failures: ${stats.resumesFailed ?? 0}`,
-          ].join("\n")
-        : null
-
-      if (backendErrors.length > 0) {
-        alert(
-          "Full sync completed with errors:\n\n" +
-            backendErrors.join("\n") +
-            (statsSummary ? `\n\n${statsSummary}` : ""),
-        )
-      } else if (jobsProcessed > 0) {
-        alert(
-          `Full sync complete: imported ${jobsProcessed} new job${jobsProcessed === 1 ? "" : "s"}.` +
-            (statsSummary ? `\n\n${statsSummary}` : ""),
-        )
-      } else {
-        alert("Full sync complete: no new matching unread emails found." + (statsSummary ? `\n\n${statsSummary}` : ""))
-      }
-    } catch (err) {
-      console.error(err)
-      const message = err instanceof Error ? err.message : "Unknown error"
-      if (controller.signal.aborted) {
-        alert("Sync timed out after 5 minutes. The poller may still be processing in the background.")
-      } else {
-        alert("Sync All failed: " + message)
-      }
-    } finally {
-      clearTimeout(timeoutId)
-      setSyncingAll(false)
-    }
+  const handleSyncAll = () => {
+    triggerSync({ syncAll: true })
   }
 
   const handleSaveSyncSettings = async () => {
@@ -363,11 +178,11 @@ export default function Settings() {
 
       if (error) throw error
       setMaxEmailsPerSync(value)
-      alert("Sync settings saved.")
+      toast.success("Sync settings saved.")
     } catch (err) {
       console.error(err)
       const message = err instanceof Error ? err.message : "Unknown error"
-      alert("Failed to save sync settings: " + message)
+      toast.error("Failed to save sync settings: " + message)
     } finally {
       setSavingSyncSettings(false)
     }
@@ -396,11 +211,11 @@ export default function Settings() {
         }));
 
         setStatus("connected");
-        alert("Integration saved successfully!");
+        toast.success("Integration saved successfully!");
     } catch (err) {
         console.error(err);
         const message = err instanceof Error ? err.message : "Unknown error";
-        alert("Failed to save integration: " + message);
+        toast.error("Failed to save integration: " + message);
     } finally {
         setLoading(false);
     }
@@ -424,11 +239,11 @@ export default function Settings() {
         }, { onConflict: "user_id" })
 
       if (error) throw error
-      alert("Keyword filters saved.")
+      toast.success("Keyword filters saved.")
     } catch (err) {
       console.error(err)
       const message = err instanceof Error ? err.message : "Unknown error"
-      alert("Failed to save keyword filters: " + message)
+      toast.error("Failed to save keyword filters: " + message)
     } finally {
       setSavingKeywordFilters(false)
     }
@@ -459,15 +274,22 @@ export default function Settings() {
                         <Badge variant="destructive">Not Configured</Badge>
                     )}
                 </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={handleSyncNow}
-                  disabled={syncing || status !== "connected"}
-                >
-                  <RefreshCw className={`mr-2 h-4 w-4 ${syncing ? "animate-spin" : ""}`} />
-                  {syncing ? "Syncing..." : "Sync Now"}
-                </Button>
+                <div className="flex flex-col items-end gap-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={handleSyncNow}
+                    disabled={syncing || status !== "connected"}
+                  >
+                    <RefreshCw className={`mr-2 h-4 w-4 ${syncing ? "animate-spin" : ""}`} />
+                    {syncing ? "Syncing..." : "Sync Now"}
+                  </Button>
+                  {syncing && progress.totalToProcess > 0 && (
+                    <span className="text-xs text-muted-foreground">
+                      Email {progress.currentEmailIndex} of {progress.totalToProcess}
+                    </span>
+                  )}
+                </div>
             </div>
 
             <form onSubmit={handleSaveIntegration} className="space-y-4">
@@ -553,10 +375,10 @@ export default function Settings() {
                 type="button"
                 variant="outline"
                 onClick={handleSyncAll}
-                disabled={syncingAll || syncing || status !== "connected"}
+                disabled={syncing || status !== "connected"}
               >
-                <RefreshCw className={`mr-2 h-4 w-4 ${syncingAll ? "animate-spin" : ""}`} />
-                {syncingAll ? "Syncing All..." : "Sync All Emails"}
+                <RefreshCw className={`mr-2 h-4 w-4 ${syncing ? "animate-spin" : ""}`} />
+                {syncing ? "Syncing..." : "Sync All Emails"}
               </Button>
               <Button type="button" onClick={handleSaveSyncSettings} disabled={savingSyncSettings}>
                 <Save className="mr-2 h-4 w-4" />

@@ -42,6 +42,8 @@ let pollStats = {
   duplicateJobs: 0,
   resumesGenerated: 0,
   resumesFailed: 0,
+  totalToProcess: 0,
+  currentEmailIndex: 0,
   errors: [],
 };
 
@@ -56,6 +58,8 @@ function resetStats() {
     duplicateJobs: 0,
     resumesGenerated: 0,
     resumesFailed: 0,
+    totalToProcess: 0,
+    currentEmailIndex: 0,
     errors: [],
   };
 }
@@ -1175,6 +1179,7 @@ async function handlePoll({ syncAll = false } = {}) {
           maxEmails: effectiveMaxEmails,
         });
         stats.emailsScanned += rawMessages.length;
+        stats.totalToProcess += rawMessages.length;
         console.log(
           `  Phase 1 done: fetched ${rawMessages.length} message(s). IMAP connection closed.`,
         );
@@ -1184,6 +1189,7 @@ async function handlePoll({ syncAll = false } = {}) {
         const uidsToMark = [];
 
         for (const raw of rawMessages) {
+          stats.currentEmailIndex += 1;
           let emailContext;
           try {
             emailContext = await parseMessage(raw.sourceBuffer, {
