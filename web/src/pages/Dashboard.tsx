@@ -147,11 +147,8 @@ export default function Dashboard() {
       }
 
       const res = await fetch("http://localhost:54350/poll", { method: "POST", signal: controller.signal })
-      if (!res.ok) {
-        const body = await res.json().catch(() => null)
-        throw new Error(body?.error || `Server returned ${res.status}`)
-      }
-      const payload = (await res.json()) as {
+
+      let payload: {
         jobs?: unknown[]
         errors?: string[]
         stats?: {
@@ -163,9 +160,29 @@ export default function Dashboard() {
           duplicateJobs?: number
           resumesGenerated?: number
           resumesFailed?: number
+          running?: boolean
         }
       }
-      const jobsProcessed = Array.isArray(payload?.jobs) ? payload.jobs.length : 0
+      if (res.status === 202) {
+        while (true) {
+          await new Promise((resolve) => setTimeout(resolve, 1000))
+          if (controller.signal.aborted) throw new Error("Aborted")
+          const statusRes = await fetch("http://localhost:54350/status", { signal: controller.signal })
+          if (!statusRes.ok) throw new Error("Failed to check status")
+          const status = await statusRes.json()
+          if (!status.running) {
+            payload = { stats: status, jobs: [], errors: status.errors || [] }
+            break
+          }
+        }
+      } else if (!res.ok) {
+        const body = await res.json().catch(() => null)
+        throw new Error(body?.error || `Server returned ${res.status}`)
+      } else {
+        payload = await res.json()
+      }
+
+      const jobsProcessed = payload?.stats?.jobsInserted ?? (Array.isArray(payload?.jobs) ? payload.jobs.length : 0)
       const backendErrors = Array.isArray(payload?.errors) ? payload.errors : []
       const stats = payload?.stats
       const statsSummary = stats

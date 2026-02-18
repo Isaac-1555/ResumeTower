@@ -14,7 +14,7 @@ import { createClient } from "@supabase/supabase-js";
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import { GoogleGenAI } from "@google/genai";
-import { PDFDocument, StandardFonts } from "pdf-lib";
+import { jsPDF } from "jspdf";
 
 const PORT = Number(process.env.POLLER_PORT || 54350);
 
@@ -31,8 +31,35 @@ const IMAP_SOCKET_TIMEOUT_MS = Number(process.env.IMAP_SOCKET_TIMEOUT_MS || 6000
 const IMAP_GREETING_TIMEOUT_MS = Number(process.env.IMAP_GREETING_TIMEOUT_MS || 15000);
 const POLL_TIMEOUT_MS = Number(process.env.POLL_TIMEOUT_MS || 180000);
 
-const DEFAULT_KEYWORDS = ["job", "hiring", "application"];
-let pollRunning = false;
+const DEFAULT_KEYWORDS = ["Indeed", "linkedin", "glassdoor"];
+let pollStats = {
+  running: false,
+  integrationsFound: 0,
+  emailsScanned: 0,
+  emailsKeywordMatched: 0,
+  opportunitiesExtracted: 0,
+  jobsInserted: 0,
+  duplicateJobs: 0,
+  resumesGenerated: 0,
+  resumesFailed: 0,
+  errors: [],
+};
+
+function resetStats() {
+  pollStats = {
+    running: true,
+    integrationsFound: 0,
+    emailsScanned: 0,
+    emailsKeywordMatched: 0,
+    opportunitiesExtracted: 0,
+    jobsInserted: 0,
+    duplicateJobs: 0,
+    resumesGenerated: 0,
+    resumesFailed: 0,
+    errors: [],
+  };
+}
+
 const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
 
 const EXTRACTION_SCHEMA = {
@@ -82,17 +109,66 @@ const ENRICHMENT_SCHEMA = {
 const RESUME_SCHEMA = {
   type: "object",
   properties: {
-    resume_json: {
-      type: "object",
-      additionalProperties: true,
+    name: { type: "string" },
+    contact: { type: "string" },
+    summary: { type: "string" },
+    experience: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          company: { type: "string" },
+          location: { type: "string" },
+          period: { type: "string" },
+          points: {
+            type: "array",
+            items: { type: "string" },
+          },
+        },
+        required: ["title", "company"],
+      },
     },
-    highlighted_keywords: {
+    education: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          degree: { type: "string" },
+          school: { type: "string" },
+          year: { type: "string" },
+          location: { type: "string" },
+        },
+      },
+    },
+    skills: {
       type: "array",
       items: { type: "string" },
     },
-    rationale: { type: "string" },
+    certifications: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          issuer: { type: "string" },
+          year: { type: "string" },
+        },
+      },
+    },
+    projects: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          description: { type: "string" },
+          link: { type: "string" },
+        },
+      },
+    },
   },
-  required: ["resume_json"],
+  required: ["name", "contact"],
 };
 
 // ---------------------------------------------------------------------------
@@ -502,37 +578,73 @@ async function fetchBaseProfile(supabase, userId) {
 async function generateTailoredResume(baseProfile, opportunity) {
   if (!ai) {
     return {
-      resume_json: baseProfile,
-      highlighted_keywords: normalizeStringArray(opportunity.required_skills || [], 30),
+      resume_json: {
+        name: baseProfile.personal_info?.name || "Candidate",
+        contact: baseProfile.personal_info?.email || "",
+        summary: "Gemini disabled - using base profile fallback",
+        experience: [],
+        education: [],
+        skills: baseProfile.skills || [],
+        certifications: [],
+        projects: [],
+      },
+      highlighted_keywords: [],
       rationale: "Gemini is disabled; using base profile as fallback.",
       generation_error: "GEMINI_API_KEY is not set",
     };
   }
 
-  const prompt = [
-    "Create a tailored resume JSON for this job using the base profile.",
-    "Constraints:",
-    "- Keep the same high-level structure as the base profile whenever possible.",
-    "- Tailor ordering and bullet emphasis to job requirements.",
-    "- Do not fabricate employers, dates, or credentials not in base profile.",
-    "- Keep output concise and recruiter-friendly.",
-    "",
-    "BASE_PROFILE_JSON:",
-    JSON.stringify(baseProfile, null, 2),
-    "",
-    "JOB_JSON:",
-    JSON.stringify(
-      {
-        job_title: opportunity.job_title,
-        company: opportunity.company,
-        location: opportunity.location,
-        description: opportunity.description,
-        required_skills: opportunity.required_skills,
-      },
-      null,
-      2,
-    ),
-  ].join("\n");
+  const styleGuide =
+    "Use a 'Professional' style: Clean, balanced whitespace, professional summary at top, clear section headings, standard corporate formatting. Focus on leadership and clarity.";
+
+  const prompt = `
+    You are an expert Resume Writer.
+    
+    MY PROFILE:
+    ${JSON.stringify(baseProfile, null, 2)}
+
+    JOB DESCRIPTION (extracted text):
+    Title: ${opportunity.job_title}
+    Company: ${opportunity.company}
+    Description: ${opportunity.description}
+    Skills: ${opportunity.required_skills?.join(", ")}
+
+    TASK:
+    Write a tailored resume for this job description based on my profile.
+    ${styleGuide}
+    
+    IMPORTANT: 
+    - Output strictly valid JSON.
+    - Schema:
+    {
+      "name": "String (My Name)",
+      "contact": "String (Phone | Email | LinkedIn | Location)",
+      "summary": "String (Professional Summary - keep it concise)",
+      "experience": [
+        { 
+          "title": "String", 
+          "company": "String", 
+          "location": "String",
+          "period": "String", 
+          "points": ["String", "String"] 
+        }
+      ],
+      "education": [
+         { "degree": "String", "school": "String", "year": "String", "location": "String" }
+      ],
+      "skills": ["String", "String"],
+      "certifications": [
+        { "name": "String", "issuer": "String", "year": "String" }
+      ],
+      "projects": [
+        { "name": "String", "description": "String", "link": "String (Optional)" }
+      ]
+    }
+    - Do not invent facts. Rephrase existing profile data to match JD keywords.
+    - IMPORTANT: If a specific field (like 'issuer' or 'year' in certifications) is NOT provided in the source profile, leave it as an empty string "". Do NOT put "N/A", "Unknown", "Ongoing", or "Present".
+    - If there is only the year and no issuer, just provide the year. If there is only the issuer and no year, just provide the issuer.
+    - Ensure bullet points are impactful (Action Verb + Context + Result).
+  `;
 
   try {
     const { parsed } = await generateStructuredJson({
@@ -540,20 +652,25 @@ async function generateTailoredResume(baseProfile, opportunity) {
       schema: RESUME_SCHEMA,
     });
 
-    if (!parsed?.resume_json || typeof parsed.resume_json !== "object") {
-      throw new Error("Missing resume_json in Gemini response");
-    }
-
     return {
-      resume_json: parsed.resume_json,
-      highlighted_keywords: normalizeStringArray(parsed?.highlighted_keywords, 40),
-      rationale: normalizeString(parsed?.rationale, ""),
+      resume_json: parsed,
+      highlighted_keywords: [],
+      rationale: "Generated via pocket-resume professional template",
       generation_error: null,
     };
   } catch (err) {
     return {
-      resume_json: baseProfile,
-      highlighted_keywords: normalizeStringArray(opportunity.required_skills || [], 30),
+      resume_json: {
+        name: baseProfile.personal_info?.name || "Error",
+        contact: "Generation Failed",
+        summary: serializeError(err),
+        experience: [],
+        education: [],
+        skills: [],
+        certifications: [],
+        projects: [],
+      },
+      highlighted_keywords: [],
       rationale: "Fallback to base profile due to resume generation error.",
       generation_error: serializeError(err),
     };
@@ -591,74 +708,287 @@ function writeObjectAsLines(prefix, value, lines, depth = 0) {
 }
 
 async function renderResumePdf(opportunity, resumeJson) {
-  const pdfDoc = await PDFDocument.create();
-  const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-  let page = pdfDoc.addPage([612, 792]);
-  const margin = 44;
-  const maxWidth = page.getWidth() - margin * 2;
-  const lineHeight = 15;
-  let y = page.getHeight() - margin;
-
-  const wrapText = (text, font, size) => {
-    const clean = normalizeString(String(text).replace(/\s+/g, " "), "");
-    if (!clean) return [];
-    const words = clean.split(" ");
-    const lines = [];
-    let current = "";
-    for (const word of words) {
-      const candidate = current ? `${current} ${word}` : word;
-      if (font.widthOfTextAtSize(candidate, size) <= maxWidth) {
-        current = candidate;
-      } else {
-        if (current) lines.push(current);
-        current = word;
-      }
-    }
-    if (current) lines.push(current);
-    return lines;
-  };
-
-  const ensureLines = (lineCount = 1) => {
-    if (y - lineCount * lineHeight >= margin) return;
-    page = pdfDoc.addPage([612, 792]);
-    y = page.getHeight() - margin;
-  };
-
-  const drawWrappedLine = (text, { size = 11, bold = false } = {}) => {
-    const font = bold ? boldFont : regularFont;
-    const wrapped = wrapText(text, font, size);
-    if (wrapped.length === 0) {
-      ensureLines(1);
-      y -= lineHeight;
-      return;
-    }
-    ensureLines(wrapped.length);
-    for (const line of wrapped) {
-      page.drawText(line, {
-        x: margin,
-        y,
-        size,
-        font,
-      });
-      y -= lineHeight;
-    }
-  };
-
-  drawWrappedLine(opportunity.job_title || "Tailored Resume", { size: 18, bold: true });
-  drawWrappedLine(`${opportunity.company || ""}${opportunity.location ? ` • ${opportunity.location}` : ""}`, {
-    size: 11,
+  // Use data from resumeJson which is structured now.
+  const data = resumeJson;
+  const doc = new jsPDF({
+    orientation: "portrait",
+    unit: "pt",
+    format: "letter",
   });
-  y -= 6;
 
-  const lines = [];
-  writeObjectAsLines("resume", resumeJson, lines);
-  for (const line of lines) {
-    drawWrappedLine(line, { size: 10, bold: false });
+  const margin = 40;
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const contentWidth = pageWidth - margin * 2;
+  const lineHeight = 1.4;
+  let y = 50;
+
+  function checkPageBreak(heightNeeded) {
+    if (y + heightNeeded > doc.internal.pageSize.getHeight() - margin) {
+      doc.addPage();
+      y = 50;
+    }
   }
 
-  return pdfDoc.save();
+  function addText(text, fontSize, fontStyle = "normal", options = {}) {
+    if (!text) return;
+    const align = options.align || "left";
+    const color = options.color || "#000000";
+    const maxWidth = options.maxWidth || contentWidth;
+    const bottomSpacing = options.bottomSpacing || 0;
+
+    doc.setFontSize(fontSize);
+    doc.setFont("helvetica", fontStyle);
+    doc.setTextColor(color);
+
+    let cleanText = String(text).replace(/•/g, "").trim();
+    // Simplified sanitization for Node
+    cleanText = cleanText.replace(/[^\x00-\x7F]/g, " ");
+
+    const lines = doc.splitTextToSize(cleanText, maxWidth);
+    const height = lines.length * fontSize * lineHeight;
+
+    checkPageBreak(height);
+
+    if (align === "center") {
+      doc.text(lines, pageWidth / 2, y, { align: "center" });
+    } else if (align === "right") {
+      doc.text(lines, pageWidth - margin, y, { align: "right" });
+    } else {
+      doc.text(lines, margin, y);
+    }
+
+    y += height + bottomSpacing;
+  }
+
+  function addSectionHeader(title) {
+    const fontSize = 12;
+    checkPageBreak(30);
+    y += 10;
+
+    doc.setFontSize(fontSize);
+    doc.setFont("helvetica", "bold");
+    doc.setTextColor("#000000");
+    doc.text(title.toUpperCase(), margin, y);
+
+    y += 6;
+    doc.setLineWidth(1);
+    doc.setDrawColor(0, 0, 0);
+    doc.line(margin, y, pageWidth - margin, y);
+
+    y += 15;
+  }
+
+  function addBullet(text) {
+    const fontSize = 11;
+    const bulletIndent = 12;
+    const maxWidth = contentWidth - bulletIndent;
+
+    doc.setFontSize(fontSize);
+    doc.setFont("helvetica", "normal");
+
+    let cleanText = String(text).replace(/[^\x00-\x7F]/g, " ");
+    const lines = doc.splitTextToSize(cleanText, maxWidth);
+    const height = lines.length * fontSize * lineHeight;
+
+    checkPageBreak(height);
+
+    const bulletY = y - fontSize / 3;
+    doc.setFillColor(0, 0, 0);
+    doc.circle(margin + 3, bulletY, 2, "F");
+
+    doc.text(lines, margin + bulletIndent, y);
+    y += height + 4;
+  }
+
+  // --- Rendering Logic (Professional Style) ---
+
+  // 1. Header
+  addText(data.name || "Candidate", 14, "bold", { align: "center", bottomSpacing: 5 });
+  addText(data.contact || "", 11, "normal", { align: "center", bottomSpacing: 15 });
+
+  // 2. Summary
+  if (data.summary) {
+    addSectionHeader("Professional Summary");
+    addText(data.summary, 11, "normal", { bottomSpacing: 10 });
+  }
+
+  // 3. Skills
+  if (data.skills && data.skills.length > 0) {
+    addSectionHeader("Skills");
+    const fontSize = 11;
+    doc.setFontSize(fontSize);
+    doc.setFont("helvetica", "normal");
+    const h = fontSize * lineHeight;
+    const bulletRadius = 1.5;
+    const bulletGap = 5;
+
+    const sanitizedSkills = data.skills
+      .map((s) => String(s || "").replace(/[^\x00-\x7F]/g, " ").trim())
+      .filter((s) => s);
+
+    let currentX = margin;
+    checkPageBreak(h);
+
+    sanitizedSkills.forEach((text, index) => {
+      doc.setFontSize(fontSize);
+      doc.setFont("helvetica", "normal");
+      const textWidth = doc.getTextWidth(text);
+
+      if (currentX > margin && currentX + textWidth > pageWidth - margin) {
+        currentX = margin;
+        y += h;
+        checkPageBreak(h);
+      }
+
+      if (textWidth > contentWidth) {
+        // Wrap long single skill
+        const wrapped = doc.splitTextToSize(text, contentWidth);
+        wrapped.forEach((line, li) => {
+          checkPageBreak(h);
+          doc.text(line, margin, y);
+          if (li < wrapped.length - 1) {
+            y += h;
+            currentX = margin;
+          } else {
+            currentX = margin + doc.getTextWidth(line);
+          }
+        });
+      } else {
+        doc.text(text, currentX, y);
+        currentX += textWidth;
+      }
+
+      if (index < sanitizedSkills.length - 1) {
+        const totalBulletWidth = bulletGap + bulletRadius * 2 + bulletGap;
+        if (currentX + totalBulletWidth > pageWidth - margin) {
+          currentX = margin;
+          y += h;
+          checkPageBreak(h);
+        }
+        currentX += bulletGap;
+        const bulletY = y - fontSize / 3;
+        doc.setFillColor(0, 0, 0);
+        doc.circle(currentX + bulletRadius, bulletY, bulletRadius, "F");
+        currentX += bulletRadius * 2 + bulletGap;
+      }
+    });
+    y += h + 10;
+  }
+
+  // 4. Experience
+  if (data.experience && data.experience.length > 0) {
+    addSectionHeader("Experience");
+    data.experience.forEach((exp) => {
+      checkPageBreak(50);
+
+      doc.setFontSize(11);
+      doc.setFont("helvetica", "normal");
+      const periodText = exp.period && !/^(n\/a|unknown)$/i.test(exp.period) ? exp.period : "";
+      const dateWidth = doc.getTextWidth(periodText);
+
+      const titleText = (exp.title || "").toUpperCase();
+      doc.setFont("helvetica", "bold");
+      const availableTitleWidth = contentWidth - dateWidth - 20;
+      let cleanTitle = titleText.replace(/[^\x00-\x7F]/g, " ");
+      const titleLines = doc.splitTextToSize(cleanTitle, availableTitleWidth);
+
+      doc.setFont("helvetica", "normal");
+      doc.text(periodText, pageWidth - margin, y, { align: "right" });
+
+      doc.setFont("helvetica", "bold");
+      doc.text(titleLines, margin, y);
+
+      const titleHeight = titleLines.length * 11 * lineHeight;
+      y += Math.max(titleHeight, 14);
+
+      doc.setFontSize(11);
+      doc.setFont("helvetica", "italic");
+      if (exp.location && !/^(n\/a|unknown)$/i.test(exp.location)) {
+        const locWidth = doc.getTextWidth(exp.location);
+        doc.setFont("helvetica", "normal");
+        doc.text(exp.location, pageWidth - margin, y, { align: "right" });
+
+        const availableCompWidth = contentWidth - locWidth - 20;
+        const companyLines = doc.splitTextToSize(exp.company || "", availableCompWidth);
+        doc.setFont("helvetica", "italic");
+        doc.text(companyLines, margin, y);
+        y += Math.max(companyLines.length * 11 * lineHeight, 14);
+      } else {
+        doc.text(exp.company || "", margin, y);
+        y += 14;
+      }
+
+      y += 4;
+      if (exp.points && Array.isArray(exp.points)) {
+        exp.points.forEach((point) => addBullet(point));
+      }
+      y += 6;
+    });
+  }
+
+  // 5. Projects
+  if (data.projects && data.projects.length > 0) {
+    addSectionHeader("Projects");
+    data.projects.forEach((proj) => {
+      checkPageBreak(30);
+      doc.setFontSize(11);
+      doc.setFont("helvetica", "bold");
+      doc.text(proj.name || "", margin, y);
+      y += 14;
+      addText(proj.description, 11, "normal", { bottomSpacing: 10 });
+    });
+  }
+
+  // 6. Education
+  if (data.education && data.education.length > 0) {
+    addSectionHeader("Education");
+    data.education.forEach((edu) => {
+      checkPageBreak(40);
+      doc.setFontSize(11);
+      doc.setFont("helvetica", "normal");
+      let yearText = edu.year && !/^(n\/a|unknown)$/i.test(edu.year) ? edu.year : "";
+      const yearWidth = doc.getTextWidth(yearText);
+
+      const availableSchoolWidth = contentWidth - yearWidth - 20;
+      doc.setFont("helvetica", "bold");
+      const schoolLines = doc.splitTextToSize(edu.school || "", availableSchoolWidth);
+
+      doc.setFont("helvetica", "normal");
+      if (yearText) doc.text(yearText, pageWidth - margin, y, { align: "right" });
+
+      doc.setFont("helvetica", "bold");
+      doc.text(schoolLines, margin, y);
+      y += Math.max(schoolLines.length * 11 * lineHeight, 14);
+
+      doc.setFont("helvetica", "normal");
+      const degreeLines = doc.splitTextToSize(edu.degree || "", contentWidth);
+      doc.text(degreeLines, margin, y);
+      y += degreeLines.length * 11 * lineHeight + 10;
+    });
+  }
+
+  // 7. Certifications
+  if (data.certifications && data.certifications.length > 0) {
+    addSectionHeader("Certifications");
+    data.certifications.forEach((cert) => {
+      checkPageBreak(20);
+      let text = cert.name || "";
+      const issuer = cert.issuer && !/^(n\/a|none|unknown|ongoing)$/i.test(cert.issuer) ? cert.issuer : "";
+      const year = cert.year && !/^(n\/a|none|unknown|ongoing|present)$/i.test(cert.year) ? cert.year : "";
+
+      if (issuer) text += ` - ${issuer}`;
+      if (year) text += ` (${year})`;
+      addBullet(text);
+    });
+    y += 6;
+  }
+
+  // Output as Uint8Array
+  return new Uint8Array(doc.output("arraybuffer"));
+}
+
+function unusedWriteObjectAsLines(prefix, value, lines, depth = 0) {
+  // This function is no longer used but kept if we need to revert
 }
 
 async function uploadResumePdf(supabase, userId, jobId, pdfBytes) {
@@ -783,265 +1113,274 @@ async function handlePoll({ syncAll = false } = {}) {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
   console.log("Polling IMAP for new jobs...");
-  const processedJobs = [];
-  const errors = [];
-  const stats = {
-    integrationsFound: 0,
-    emailsScanned: 0,
-    emailsKeywordMatched: 0,
-    opportunitiesExtracted: 0,
-    jobsInserted: 0,
-    duplicateJobs: 0,
-    resumesGenerated: 0,
-    resumesFailed: 0,
-  };
+  // resetStats() is now called by the HTTP handler before calling this function
+  const stats = pollStats;
+  const errors = pollStats.errors;
 
-  const { data: integrations, error: intError } = await supabase
-    .from("user_integrations")
-    .select("*")
-    .not("imap_host", "is", null)
-    .not("imap_user", "is", null)
-    .not("imap_password_encrypted", "is", null);
+  try {
+    const { data: integrations, error: intError } = await supabase
+      .from("user_integrations")
+      .select("*")
+      .not("imap_host", "is", null)
+      .not("imap_user", "is", null)
+      .not("imap_password_encrypted", "is", null);
 
-  if (intError) throw intError;
-  if (!integrations || integrations.length === 0) {
-    return {
-      status: 200,
-      body: { message: "No integrations found", jobs: [], errors: [], stats },
-    };
-  }
-  stats.integrationsFound = integrations.length;
+    if (intError) throw intError;
+    if (!integrations || integrations.length === 0) {
+      console.log("No integrations found");
+      return;
+    }
+    stats.integrationsFound = integrations.length;
 
-  console.log(`Found ${integrations.length} integration(s).`);
-  if (!ai) {
-    console.warn("GEMINI_API_KEY is not set. Falling back to non-LLM extraction and base-profile resumes.");
-  }
+    console.log(`Found ${integrations.length} integration(s).`);
+    if (!ai) {
+      console.warn(
+        "GEMINI_API_KEY is not set. Falling back to non-LLM extraction and base-profile resumes.",
+      );
+    }
 
-  for (const integration of integrations) {
-    const {
-      user_id,
-      imap_host,
-      imap_port,
-      imap_user,
-      imap_password_encrypted,
-      encryption_iv,
-      job_keywords,
-      keyword_match_scope,
-      max_emails_per_sync,
-    } = integration;
+    for (const integration of integrations) {
+      const {
+        user_id,
+        imap_host,
+        imap_port,
+        imap_user,
+        imap_password_encrypted,
+        encryption_iv,
+        job_keywords,
+        keyword_match_scope,
+        max_emails_per_sync,
+      } = integration;
 
-    // Determine effective email limit for this user
-    const effectiveMaxEmails = syncAll
-      ? 0 // 0 = unlimited
-      : (typeof max_emails_per_sync === "number" && max_emails_per_sync > 0
+      // Determine effective email limit for this user
+      const effectiveMaxEmails = syncAll
+        ? 0 // 0 = unlimited
+        : typeof max_emails_per_sync === "number" && max_emails_per_sync > 0
           ? max_emails_per_sync
-          : 10); // default to 10
+          : 10; // default to 10
 
-    const keywords = Array.isArray(job_keywords) && job_keywords.length > 0
-      ? [...new Set(job_keywords.map((k) => String(k).trim().toLowerCase()).filter(Boolean))]
-      : DEFAULT_KEYWORDS;
-    const matchInBody = keyword_match_scope === "subject_or_body";
+      const keywords =
+        Array.isArray(job_keywords) && job_keywords.length > 0
+          ? [...new Set(job_keywords.map((k) => String(k).trim().toLowerCase()).filter(Boolean))]
+          : DEFAULT_KEYWORDS;
+      const matchInBody = keyword_match_scope === "subject_or_body";
 
-    try {
-      const password = await decrypt(imap_password_encrypted, encryption_iv);
-      const baseProfile = await fetchBaseProfile(supabase, user_id);
+      try {
+        const password = await decrypt(imap_password_encrypted, encryption_iv);
+        const baseProfile = await fetchBaseProfile(supabase, user_id);
 
-      // --- Phase 1: Fetch all unread messages (short IMAP connection) ---
-      console.log(`  Phase 1: Fetching unread emails from ${imap_host}...`);
-      const rawMessages = await imapFetchUnread(imap_host, imap_port, imap_user, password, { maxEmails: effectiveMaxEmails });
-      stats.emailsScanned += rawMessages.length;
-      console.log(`  Phase 1 done: fetched ${rawMessages.length} message(s). IMAP connection closed.`);
+        // --- Phase 1: Fetch all unread messages (short IMAP connection) ---
+        console.log(`  Phase 1: Fetching unread emails from ${imap_host}...`);
+        const rawMessages = await imapFetchUnread(imap_host, imap_port, imap_user, password, {
+          maxEmails: effectiveMaxEmails,
+        });
+        stats.emailsScanned += rawMessages.length;
+        console.log(
+          `  Phase 1 done: fetched ${rawMessages.length} message(s). IMAP connection closed.`,
+        );
 
-      // --- Phase 2: Process messages offline (no IMAP connection) ---
-      console.log(`  Phase 2: Processing messages...`);
-      const uidsToMark = [];
+        // --- Phase 2: Process messages offline (no IMAP connection) ---
+        console.log(`  Phase 2: Processing messages...`);
+        const uidsToMark = [];
 
-      for (const raw of rawMessages) {
-        let emailContext;
-        try {
-          emailContext = await parseMessage(raw.sourceBuffer, { uid: raw.uid, envelope: raw.envelope });
-        } catch (err) {
-          errors.push(`Failed to parse message UID ${raw.uid}: ${serializeError(err)}`);
-          continue;
-        }
-
-        // Deduplication: if we already have jobs from this email_id, skip it.
-        // This avoids re-processing old emails that are fetched again.
-        const { count: existingEmailCount, error: existingEmailError } = await supabase
-          .from("jobs")
-          .select("*", { count: "exact", head: true })
-          .eq("user_id", user_id)
-          .eq("email_id", emailContext.messageId);
-
-        if (existingEmailError) {
-           console.warn(`  Warning: failed to check existing email_id ${emailContext.messageId}:`, existingEmailError.message);
-        } else if (existingEmailCount && existingEmailCount > 0) {
-           // We have already processed this email.
-           // console.log(`  Skipping already-processed email: ${emailContext.subject} (${emailContext.messageId})`);
-           continue;
-        }
-
-        const matches = keywordMatch(emailContext, keywords, matchInBody);
-        if (!matches) continue;
-        stats.emailsKeywordMatched += 1;
-
-        const opportunities = await extractOpportunitiesFromEmail(emailContext);
-        stats.opportunitiesExtracted += opportunities.length;
-        let messagePersisted = false;
-
-        for (const extracted of opportunities) {
-          const enriched = await enrichOpportunityWithUrls(extracted, emailContext.links);
-          const primaryUrl = enriched.apply_url || enriched.posting_url || emailContext.links[0]?.url || null;
-          const fingerprint = buildJobFingerprint(emailContext.messageId, enriched);
-
-          const { data: existingJob, error: existingError } = await supabase
-            .from("jobs")
-            .select("id")
-            .eq("user_id", user_id)
-            .eq("email_id", emailContext.messageId)
-            .eq("job_fingerprint", fingerprint)
-            .maybeSingle();
-
-          if (existingError) {
-            errors.push(`Existing-job check failed for "${enriched.job_title}": ${serializeError(existingError)}`);
-            continue;
-          }
-          if (existingJob) {
-            stats.duplicateJobs += 1;
-            messagePersisted = true;
-            continue;
-          }
-
-          const jobData = {
-            email_id: emailContext.messageId,
-            user_id,
-            job_fingerprint: fingerprint,
-            job_title: normalizeString(enriched.job_title, emailContext.subject),
-            company: normalizeString(
-              enriched.company,
-              normalizeString(emailContext.from.split("<")[0], emailContext.from),
-            ),
-            location: normalizeString(enriched.location, "Unknown"),
-            description: truncate(
-              normalizeString(enriched.description, emailContext.textBody || emailContext.subject),
-              MAX_DESCRIPTION_CHARS,
-            ),
-            job_link: primaryUrl || `imap://${imap_host}/INBOX/${raw.uid}`,
-            posting_url: enriched.posting_url || primaryUrl,
-            apply_url: enriched.apply_url || primaryUrl,
-            source_subject: emailContext.subject,
-            source_from: emailContext.from,
-            source_received_at: emailContext.receivedAt,
-            source_message_uid: raw.uid,
-            source_links: emailContext.links,
-            status: "prepared",
-            extracted_skills: normalizeStringArray(enriched.required_skills, 60),
-            extraction_model: GEMINI_MODEL,
-            extraction_confidence: enriched.confidence,
-            extraction_raw: {
-              extraction: extracted.raw || null,
-              enrichment_status: enriched.enrichment_status || null,
-              enrichment_error: enriched.enrichment_error || null,
-              url_context_metadata: enriched.url_context_metadata || null,
-            },
-            parse_status:
-              enriched.enrichment_status === "error"
-                ? "partial"
-                : "parsed",
-            parse_error: enriched.enrichment_error || null,
-          };
-
-          const { data: insertedJob, error: insertError } = await supabase
-            .from("jobs")
-            .insert(jobData)
-            .select()
-            .single();
-
-          if (insertError) {
-            errors.push(`Job insert failed for "${jobData.job_title}": ${serializeError(insertError)}`);
-            continue;
-          }
-
-          stats.jobsInserted += 1;
-          processedJobs.push(insertedJob);
-          messagePersisted = true;
-
+        for (const raw of rawMessages) {
+          let emailContext;
           try {
-            const resumeGeneration = await generateTailoredResume(baseProfile, {
-              ...enriched,
-              ...insertedJob,
+            emailContext = await parseMessage(raw.sourceBuffer, {
+              uid: raw.uid,
+              envelope: raw.envelope,
             });
-            const pdfBytes = await renderResumePdf(
-              {
-                job_title: insertedJob.job_title,
-                company: insertedJob.company,
-                location: insertedJob.location,
-              },
-              resumeGeneration.resume_json,
-            );
-            const resumePdfUrl = await uploadResumePdf(
-              supabase,
-              user_id,
-              insertedJob.id,
-              pdfBytes,
-            );
+          } catch (err) {
+            errors.push(`Failed to parse message UID ${raw.uid}: ${serializeError(err)}`);
+            continue;
+          }
 
-            const { error: resumeInsertError } = await supabase
-              .from("resumes")
-              .insert({
+          // Deduplication: if we already have jobs from this email_id, skip it.
+          const { count: existingEmailCount, error: existingEmailError } = await supabase
+            .from("jobs")
+            .select("*", { count: "exact", head: true })
+            .eq("user_id", user_id)
+            .eq("email_id", emailContext.messageId);
+
+          if (existingEmailError) {
+            console.warn(
+              `  Warning: failed to check existing email_id ${emailContext.messageId}:`,
+              existingEmailError.message,
+            );
+          } else if (existingEmailCount && existingEmailCount > 0) {
+            continue;
+          }
+
+          const matches = keywordMatch(emailContext, keywords, matchInBody);
+          if (!matches) continue;
+          stats.emailsKeywordMatched += 1;
+
+          const opportunities = await extractOpportunitiesFromEmail(emailContext);
+          stats.opportunitiesExtracted += opportunities.length;
+          let messagePersisted = false;
+
+          for (const extracted of opportunities) {
+            const enriched = await enrichOpportunityWithUrls(extracted, emailContext.links);
+            const primaryUrl =
+              enriched.apply_url ||
+              enriched.posting_url ||
+              emailContext.links[0]?.url ||
+              null;
+            const fingerprint = buildJobFingerprint(emailContext.messageId, enriched);
+
+            const { data: existingJob, error: existingError } = await supabase
+              .from("jobs")
+              .select("id")
+              .eq("user_id", user_id)
+              .eq("email_id", emailContext.messageId)
+              .eq("job_fingerprint", fingerprint)
+              .maybeSingle();
+
+            if (existingError) {
+              errors.push(
+                `Existing-job check failed for "${enriched.job_title}": ${serializeError(existingError)}`,
+              );
+              continue;
+            }
+            if (existingJob) {
+              stats.duplicateJobs += 1;
+              messagePersisted = true;
+              continue;
+            }
+
+            const jobData = {
+              email_id: emailContext.messageId,
+              user_id,
+              job_fingerprint: fingerprint,
+              job_title: normalizeString(enriched.job_title, emailContext.subject),
+              company: normalizeString(
+                enriched.company,
+                normalizeString(emailContext.from.split("<")[0], emailContext.from),
+              ),
+              location: normalizeString(enriched.location, "Unknown"),
+              description: truncate(
+                normalizeString(
+                  enriched.description,
+                  emailContext.textBody || emailContext.subject,
+                ),
+                MAX_DESCRIPTION_CHARS,
+              ),
+              job_link: primaryUrl || `imap://${imap_host}/INBOX/${raw.uid}`,
+              posting_url: enriched.posting_url || primaryUrl,
+              apply_url: enriched.apply_url || primaryUrl,
+              source_subject: emailContext.subject,
+              source_from: emailContext.from,
+              source_received_at: emailContext.receivedAt,
+              source_message_uid: raw.uid,
+              source_links: emailContext.links,
+              status: "prepared",
+              extracted_skills: normalizeStringArray(enriched.required_skills, 60),
+              extraction_model: GEMINI_MODEL,
+              extraction_confidence: enriched.confidence,
+              extraction_raw: {
+                extraction: extracted.raw || null,
+                enrichment_status: enriched.enrichment_status || null,
+                enrichment_error: enriched.enrichment_error || null,
+                url_context_metadata: enriched.url_context_metadata || null,
+              },
+              parse_status: enriched.enrichment_status === "error" ? "partial" : "parsed",
+              parse_error: enriched.enrichment_error || null,
+            };
+
+            const { data: insertedJob, error: insertError } = await supabase
+              .from("jobs")
+              .insert(jobData)
+              .select()
+              .single();
+
+            if (insertError) {
+              errors.push(
+                `Job insert failed for "${jobData.job_title}": ${serializeError(insertError)}`,
+              );
+              continue;
+            }
+
+            stats.jobsInserted += 1;
+            messagePersisted = true;
+
+            try {
+              const resumeGeneration = await generateTailoredResume(baseProfile, {
+                ...enriched,
+                ...insertedJob,
+              });
+              const pdfBytes = await renderResumePdf(
+                {
+                  job_title: insertedJob.job_title,
+                  company: insertedJob.company,
+                  location: insertedJob.location,
+                },
+                resumeGeneration.resume_json,
+              );
+              const resumePdfUrl = await uploadResumePdf(
+                supabase,
+                user_id,
+                insertedJob.id,
+                pdfBytes,
+              );
+
+              const { error: resumeInsertError } = await supabase.from("resumes").insert({
                 job_id: insertedJob.id,
                 user_id,
                 resume_json: resumeGeneration.resume_json,
                 resume_pdf_url: resumePdfUrl,
               });
 
-            if (resumeInsertError) {
-              throw resumeInsertError;
+              if (resumeInsertError) {
+                throw resumeInsertError;
+              }
+              stats.resumesGenerated += 1;
+            } catch (resumeErr) {
+              stats.resumesFailed += 1;
+              errors.push(
+                `Resume generation failed for "${jobData.job_title}": ${serializeError(resumeErr)}`,
+              );
             }
-            stats.resumesGenerated += 1;
-          } catch (resumeErr) {
-            stats.resumesFailed += 1;
-            errors.push(
-              `Resume generation failed for "${jobData.job_title}": ${serializeError(resumeErr)}`,
-            );
+          }
+
+          if (messagePersisted) {
+            uidsToMark.push(raw.uid);
           }
         }
-
-        if (messagePersisted) {
-          uidsToMark.push(raw.uid);
-        }
-      }
-      console.log(`  Phase 2 done: ${stats.jobsInserted} job(s) inserted, ${uidsToMark.length} message(s) to mark read.`);
-
-      // --- Phase 3: Mark processed messages as read (short IMAP connection) ---
-      if (uidsToMark.length > 0) {
-        console.log(`  Phase 3: Marking ${uidsToMark.length} message(s) as read...`);
-        try {
-          await imapMarkAsRead(imap_host, imap_port, imap_user, password, uidsToMark);
-          console.log(`  Phase 3 done.`);
-        } catch (markErr) {
-          errors.push(`Failed to mark messages as read: ${serializeError(markErr)}`);
-        }
-      }
-    } catch (err) {
-      console.error(`Error processing user ${user_id}:`, err);
-      if (err?.authenticationFailed) {
-        errors.push(
-          "IMAP authentication failed. If using Gmail, make sure you are using a Google App Password (not your regular password). Generate one at https://myaccount.google.com/apppasswords",
+        console.log(
+          `  Phase 2 done: ${stats.jobsInserted} job(s) inserted, ${uidsToMark.length} message(s) to mark read.`,
         );
-      } else {
-        errors.push(err?.message || String(err));
+
+        // --- Phase 3: Mark processed messages as read (short IMAP connection) ---
+        if (uidsToMark.length > 0) {
+          console.log(`  Phase 3: Marking ${uidsToMark.length} message(s) as read...`);
+          try {
+            await imapMarkAsRead(imap_host, imap_port, imap_user, password, uidsToMark);
+            console.log(`  Phase 3 done.`);
+          } catch (markErr) {
+            errors.push(`Failed to mark messages as read: ${serializeError(markErr)}`);
+          }
+        }
+      } catch (err) {
+        console.error(`Error processing user ${user_id}:`, err);
+        if (err?.authenticationFailed) {
+          errors.push(
+            "IMAP authentication failed. If using Gmail, make sure you are using a Google App Password.",
+          );
+        } else {
+          errors.push(err?.message || String(err));
+        }
       }
     }
-  }
 
-  console.log(
-    `Done. Imported ${processedJobs.length} job(s), ${errors.length} error(s).`,
-  );
-  return {
-    status: 200,
-    body: { message: "Polled successfully", jobs: processedJobs, errors, stats },
-  };
+    console.log(
+      `Done. Imported ${stats.jobsInserted} job(s), ${errors.length} error(s).`,
+    );
+  } catch (err) {
+    console.error("Critical poll error:", err);
+    errors.push(err.message || String(err));
+  } finally {
+    pollStats.running = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,13 +1405,19 @@ const server = http.createServer(async (req, res) => {
   // Health check
   if (url.pathname === "/health") {
     res.writeHead(200, { ...CORS, "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: true, pollRunning }));
+    return res.end(JSON.stringify({ ok: true, pollRunning: pollStats.running }));
+  }
+
+  // Status check
+  if (url.pathname === "/status") {
+    res.writeHead(200, { ...CORS, "Content-Type": "application/json" });
+    return res.end(JSON.stringify(pollStats));
   }
 
   if (url.pathname === "/poll" && req.method === "POST") {
-    if (pollRunning) {
+    if (pollStats.running) {
       res.writeHead(409, { ...CORS, "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ error: "A sync is already in progress. Please wait for it to finish." }));
+      return res.end(JSON.stringify({ error: "A sync is already in progress. Please wait for it to finish.", stats: pollStats }));
     }
 
     // Parse request body for options (e.g. { syncAll: true })
@@ -1087,21 +1432,16 @@ const server = http.createServer(async (req, res) => {
     }
     const syncAll = reqBody?.syncAll === true;
 
-    pollRunning = true;
-    try {
-      const timeout = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Poll timed out — the IMAP server may be unreachable or slow. Check your IMAP host/port/credentials.")), POLL_TIMEOUT_MS),
-      );
-      const result = await Promise.race([handlePoll({ syncAll }), timeout]);
-      res.writeHead(result.status, { ...CORS, "Content-Type": "application/json" });
-      return res.end(JSON.stringify(result.body));
-    } catch (err) {
-      console.error("Poll error:", err);
-      res.writeHead(500, { ...CORS, "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ error: err.message }));
-    } finally {
-      pollRunning = false;
-    }
+    // Start background polling
+    resetStats();
+    handlePoll({ syncAll }).catch((err) => {
+      console.error("Background poll error:", err);
+      pollStats.running = false;
+      pollStats.errors.push(String(err));
+    });
+
+    res.writeHead(202, { ...CORS, "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ message: "Polling started in background", stats: pollStats }));
   }
 
   res.writeHead(404, { ...CORS, "Content-Type": "application/json" });
