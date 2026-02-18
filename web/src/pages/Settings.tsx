@@ -5,19 +5,40 @@ import { Label } from "@/components/ui/label"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { Badge } from "@/components/ui/badge"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { RefreshCw, Save } from "lucide-react"
 import { supabase } from "@/lib/supabase"
 import { APP_USER_EMAIL, APP_USER_ID } from "@/lib/appUser"
 import { toast } from "sonner"
 import { useSyncContext } from "@/hooks/useSyncContext"
+
 type KeywordMatchScope = "subject" | "subject_or_body"
 const DEFAULT_JOB_KEYWORDS = ["job", "hiring", "application"]
+
+type LlmProvider = "openrouter" | "gemini" | "disabled"
+const DEFAULT_LLM_PROVIDER: LlmProvider = "openrouter"
+const DEFAULT_LLM_MODEL = "qwen/qwen3-coder"
+const LLM_MODEL_OPTIONS = [
+  { label: "Qwen3 Coder (OpenRouter)", value: "qwen/qwen3-coder" },
+  { label: "DeepSeek R1 (OpenRouter)", value: "deepseek/deepseek-r1" },
+]
 
 export default function Settings() {
   const [loading, setLoading] = useState(false)
   const { syncing, progress, triggerSync } = useSyncContext()
   const [savingKeywordFilters, setSavingKeywordFilters] = useState(false)
   const [savingSyncSettings, setSavingSyncSettings] = useState(false)
+  const [savingLlmSettings, setSavingLlmSettings] = useState(false)
+  const [llmConfig, setLlmConfig] = useState<{ provider: LlmProvider; model: string }>({
+    provider: DEFAULT_LLM_PROVIDER,
+    model: DEFAULT_LLM_MODEL,
+  })
   const [imapConfig, setImapConfig] = useState({
     host: "",
     port: 993,
@@ -40,7 +61,7 @@ export default function Settings() {
     const checkIntegration = async () => {
         const { data } = await supabase
           .from('user_integrations')
-          .select('imap_host, job_keywords, keyword_match_scope, max_emails_per_sync')
+          .select('imap_host, job_keywords, keyword_match_scope, max_emails_per_sync, llm_provider, llm_model')
           .eq('user_id', APP_USER_ID)
           .maybeSingle();
 
@@ -70,6 +91,14 @@ export default function Settings() {
         if (typeof data.max_emails_per_sync === "number" && data.max_emails_per_sync > 0) {
           setMaxEmailsPerSync(data.max_emails_per_sync);
         }
+
+        const provider: LlmProvider =
+          data.llm_provider === "gemini" || data.llm_provider === "disabled" ? data.llm_provider : "openrouter"
+        const model = typeof data.llm_model === "string" && data.llm_model.trim().length > 0
+          ? data.llm_model.trim()
+          : DEFAULT_LLM_MODEL
+
+        setLlmConfig({ provider, model })
 
         const keywords = Array.isArray(data.job_keywords) && data.job_keywords.length > 0
           ? data.job_keywords
@@ -185,6 +214,33 @@ export default function Settings() {
       toast.error("Failed to save sync settings: " + message)
     } finally {
       setSavingSyncSettings(false)
+    }
+  }
+
+  const handleSaveLlmSettings = async () => {
+    setSavingLlmSettings(true)
+    try {
+      const provider = llmConfig.provider
+      const model = llmConfig.model.trim() || DEFAULT_LLM_MODEL
+
+      const { error } = await supabase
+        .from("user_integrations")
+        .upsert({
+          user_id: APP_USER_ID,
+          llm_provider: provider,
+          llm_model: model,
+          updated_at: new Date().toISOString(),
+        }, { onConflict: "user_id" })
+
+      if (error) throw error
+      setLlmConfig({ provider, model })
+      toast.success("LLM settings saved.")
+    } catch (err) {
+      console.error(err)
+      const message = err instanceof Error ? err.message : "Unknown error"
+      toast.error("Failed to save LLM settings: " + message)
+    } finally {
+      setSavingLlmSettings(false)
     }
   }
 
@@ -383,6 +439,71 @@ export default function Settings() {
               <Button type="button" onClick={handleSaveSyncSettings} disabled={savingSyncSettings}>
                 <Save className="mr-2 h-4 w-4" />
                 {savingSyncSettings ? "Saving..." : "Save Sync Settings"}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-2xl shadow-sm">
+          <CardHeader>
+            <CardTitle>LLM Settings</CardTitle>
+            <CardDescription>
+              Choose which model the poller uses for extraction and resume generation.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Label>Provider</Label>
+              <Select
+                value={llmConfig.provider}
+                onValueChange={(value) => setLlmConfig((prev) => ({ ...prev, provider: value as LlmProvider }))}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select a provider" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="openrouter">OpenRouter</SelectItem>
+                  <SelectItem value="disabled">Disabled (no LLM)</SelectItem>
+                  <SelectItem value="gemini">Gemini (legacy)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-2">
+              <Label>Model</Label>
+              <Select
+                value={LLM_MODEL_OPTIONS.some((opt) => opt.value === llmConfig.model) ? llmConfig.model : "__custom__"}
+                onValueChange={(value) => {
+                  if (value === "__custom__") return
+                  setLlmConfig((prev) => ({ ...prev, model: value }))
+                }}
+                disabled={llmConfig.provider !== "openrouter"}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select a model" />
+                </SelectTrigger>
+                <SelectContent>
+                  {LLM_MODEL_OPTIONS.map((opt) => (
+                    <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                  ))}
+                  <SelectItem value="__custom__">Custom…</SelectItem>
+                </SelectContent>
+              </Select>
+              <Input
+                placeholder="OpenRouter model id (e.g. qwen/qwen3-coder)"
+                value={llmConfig.model}
+                onChange={(e) => setLlmConfig((prev) => ({ ...prev, model: e.target.value }))}
+                disabled={llmConfig.provider !== "openrouter"}
+              />
+              <p className="text-xs text-muted-foreground">
+                If provider is OpenRouter, the poller expects an `OPENROUTER_API_KEY` env var.
+              </p>
+            </div>
+
+            <div className="flex justify-end pt-2">
+              <Button type="button" onClick={handleSaveLlmSettings} disabled={savingLlmSettings}>
+                <Save className="mr-2 h-4 w-4" />
+                {savingLlmSettings ? "Saving..." : "Save LLM Settings"}
               </Button>
             </div>
           </CardContent>

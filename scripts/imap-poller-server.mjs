@@ -21,8 +21,20 @@ const PORT = Number(process.env.POLLER_PORT || 54350);
 const SUPABASE_URL = process.env.SUPABASE_URL || "http://127.0.0.1:54321";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const IMAP_SECRET_KEY = process.env.IMAP_SECRET_KEY || "";
+
+// LLM config
+const LLM_PROVIDER_DEFAULT = process.env.LLM_PROVIDER || "openrouter"; // openrouter | gemini | disabled
+
+// OpenRouter
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+const OPENROUTER_MODEL_DEFAULT = process.env.OPENROUTER_MODEL || "qwen/qwen3-coder";
+const OPENROUTER_ENABLE_RESPONSE_HEALING =
+  String(process.env.OPENROUTER_ENABLE_RESPONSE_HEALING || "").toLowerCase() === "true";
+
+// Gemini (legacy)
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL_DEFAULT = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+
 const MAX_EMAILS_PER_SYNC = Number(process.env.MAX_EMAILS_PER_SYNC || 50);
 const MAX_LINKS_PER_EMAIL = Number(process.env.MAX_LINKS_PER_EMAIL || 20);
 const MAX_EMAIL_TEXT_CHARS = Number(process.env.MAX_EMAIL_TEXT_CHARS || 24000);
@@ -30,6 +42,12 @@ const MAX_DESCRIPTION_CHARS = Number(process.env.MAX_DESCRIPTION_CHARS || 8000);
 const IMAP_SOCKET_TIMEOUT_MS = Number(process.env.IMAP_SOCKET_TIMEOUT_MS || 60000);
 const IMAP_GREETING_TIMEOUT_MS = Number(process.env.IMAP_GREETING_TIMEOUT_MS || 15000);
 const POLL_TIMEOUT_MS = Number(process.env.POLL_TIMEOUT_MS || 180000);
+
+// Optional: fetch URL text to enrich job opportunities (replaces Gemini urlContext tool).
+const URL_CONTEXT_TIMEOUT_MS = Number(process.env.URL_CONTEXT_TIMEOUT_MS || 8000);
+const URL_CONTEXT_MAX_BYTES = Number(process.env.URL_CONTEXT_MAX_BYTES || 140000);
+const URL_CONTEXT_MAX_CHARS = Number(process.env.URL_CONTEXT_MAX_CHARS || 7000);
+const URL_CONTEXT_MAX_URLS = Number(process.env.URL_CONTEXT_MAX_URLS || 3);
 
 const DEFAULT_KEYWORDS = ["Indeed", "linkedin", "glassdoor"];
 let pollStats = {
@@ -64,7 +82,7 @@ function resetStats() {
   };
 }
 
-const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
+const geminiAi = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
 
 const EXTRACTION_SCHEMA = {
   type: "object",
@@ -218,6 +236,139 @@ function normalizeUrl(value) {
   }
 }
 
+function isIpv4(hostname) {
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname);
+}
+
+function isPrivateIpv4(ip) {
+  const parts = ip.split(".").map((x) => Number(x));
+  if (parts.some((x) => Number.isNaN(x) || x < 0 || x > 255)) return true;
+
+  const [a, b] = parts;
+  if (a === 10) return true;
+  if (a === 127) return true;
+  if (a === 0) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  return false;
+}
+
+function isBlockedUrl(urlString) {
+  try {
+    const parsed = new URL(urlString);
+    const hostname = parsed.hostname.toLowerCase();
+
+    if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local")) {
+      return true;
+    }
+
+    if (isIpv4(hostname) && isPrivateIpv4(hostname)) return true;
+
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function htmlToText(html) {
+  if (!html) return "";
+  const noScripts = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ");
+  return normalizeString(noScripts.replace(/<[^>]*>/g, " ").replace(/\s+/g, " "), "");
+}
+
+async function fetchUrlText(url) {
+  if (!url) return null;
+  if (isBlockedUrl(url)) {
+    return {
+      url,
+      ok: false,
+      status: null,
+      contentType: null,
+      text: "",
+      error: "blocked_url",
+    };
+  }
+
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: AbortSignal.timeout(URL_CONTEXT_TIMEOUT_MS),
+      headers: {
+        "User-Agent": "ResumeTower/1.0 (+local poller)",
+        Accept: "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
+      },
+    });
+
+    const contentType = normalizeString(res.headers.get("content-type") || "", "");
+
+    // Stream-read up to URL_CONTEXT_MAX_BYTES
+    const reader = res.body?.getReader?.();
+    if (!reader) {
+      const text = await res.text();
+      const normalized = contentType.includes("html") ? htmlToText(text) : normalizeString(text, "");
+      return {
+        url,
+        ok: res.ok,
+        status: res.status,
+        contentType,
+        text: truncate(normalized, URL_CONTEXT_MAX_CHARS),
+        error: res.ok ? null : `http_${res.status}`,
+      };
+    }
+
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > URL_CONTEXT_MAX_BYTES) {
+        chunks.push(value.slice(0, Math.max(0, value.byteLength - (total - URL_CONTEXT_MAX_BYTES))));
+        break;
+      }
+      chunks.push(value);
+    }
+
+    const buffer = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+    const rawText = buffer.toString("utf-8");
+    const normalized = contentType.includes("html") ? htmlToText(rawText) : normalizeString(rawText, "");
+
+    return {
+      url,
+      ok: res.ok,
+      status: res.status,
+      contentType,
+      text: truncate(normalized, URL_CONTEXT_MAX_CHARS),
+      error: res.ok ? null : `http_${res.status}`,
+    };
+  } catch (err) {
+    return {
+      url,
+      ok: false,
+      status: null,
+      contentType: null,
+      text: "",
+      error: serializeError(err),
+    };
+  }
+}
+
+async function fetchUrlContexts(urls) {
+  const unique = [...new Set((urls || []).map((u) => normalizeUrl(u)).filter(Boolean))];
+  const limited = unique.slice(0, URL_CONTEXT_MAX_URLS);
+  const results = [];
+  for (const url of limited) {
+    const ctx = await fetchUrlText(url);
+    if (ctx) results.push(ctx);
+  }
+  return results;
+}
+
 function normalizeStringArray(values, max = 40) {
   if (!Array.isArray(values)) return [];
   const unique = new Set();
@@ -335,16 +486,96 @@ function keywordMatch({ subject, textBody }, keywords, matchInBody) {
   return keywords.some((keyword) => bodyLower.includes(keyword));
 }
 
-async function generateStructuredJson({ prompt, schema, tools }) {
-  if (!ai) throw new Error("GEMINI_API_KEY is not set");
+function stripCodeFences(text) {
+  const trimmed = normalizeString(text, "");
+  if (!trimmed) return "";
+
+  // ```json ... ```
+  const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenceMatch?.[1]) return fenceMatch[1].trim();
+
+  return trimmed;
+}
+
+function extractJsonObjectSubstring(text) {
+  const cleaned = stripCodeFences(text);
+  const firstCurly = cleaned.indexOf("{");
+  const lastCurly = cleaned.lastIndexOf("}");
+  if (firstCurly !== -1 && lastCurly !== -1 && lastCurly > firstCurly) {
+    return cleaned.slice(firstCurly, lastCurly + 1);
+  }
+
+  const firstBracket = cleaned.indexOf("[");
+  const lastBracket = cleaned.lastIndexOf("]");
+  if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+    return cleaned.slice(firstBracket, lastBracket + 1);
+  }
+
+  return cleaned;
+}
+
+function parseJsonLenient(text, sourceLabel = "LLM") {
+  const candidate = extractJsonObjectSubstring(text);
+  try {
+    return JSON.parse(candidate);
+  } catch (err) {
+    throw new Error(`${sourceLabel} returned invalid JSON: ${serializeError(err)}`);
+  }
+}
+
+async function openrouterChatCompletions({ model, prompt, responseFormat }) {
+  if (!OPENROUTER_API_KEY) {
+    throw new Error("OPENROUTER_API_KEY is not set");
+  }
+
+  const payload = {
+    model,
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.2,
+  };
+
+  if (responseFormat) payload.response_format = responseFormat;
+  if (OPENROUTER_ENABLE_RESPONSE_HEALING && responseFormat) {
+    payload.plugins = [{ id: "response-healing" }];
+  }
+
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+      // Recommended by OpenRouter (optional)
+      "HTTP-Referer": "http://localhost",
+      "X-Title": "ResumeTower",
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(120_000),
+  });
+
+  const raw = await res.json().catch(() => null);
+  if (!res.ok) {
+    const message = raw?.error?.message || raw?.message || `OpenRouter returned ${res.status}`;
+    throw new Error(message);
+  }
+
+  const text = normalizeString(raw?.choices?.[0]?.message?.content, "");
+  if (!text) {
+    throw new Error("OpenRouter returned an empty response");
+  }
+
+  return { text, raw };
+}
+
+async function geminiGenerateContent({ model, prompt, schema }) {
+  if (!geminiAi) throw new Error("GEMINI_API_KEY is not set");
+
   const config = {
     responseMimeType: "application/json",
     responseJsonSchema: schema,
   };
-  if (tools?.length) config.tools = tools;
 
-  const response = await ai.models.generateContent({
-    model: GEMINI_MODEL,
+  const response = await geminiAi.models.generateContent({
+    model,
     contents: prompt,
     config,
   });
@@ -361,14 +592,64 @@ async function generateStructuredJson({ prompt, schema, tools }) {
     throw new Error("Gemini returned an empty response");
   }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch (err) {
-    throw new Error(`Gemini returned invalid JSON: ${serializeError(err)}`);
+  return { text, raw: response };
+}
+
+async function generateStructuredJson({ prompt, schema, llm, schemaName = "result" }) {
+  if (!llm || llm.provider === "disabled") {
+    throw new Error("LLM is disabled");
   }
 
-  return { parsed, response, responseText: text };
+  if (llm.provider === "openrouter") {
+    const model = normalizeString(llm.model, OPENROUTER_MODEL_DEFAULT);
+
+    // 1) Prefer strict JSON schema outputs
+    try {
+      const { text, raw } = await openrouterChatCompletions({
+        model,
+        prompt,
+        responseFormat: {
+          type: "json_schema",
+          json_schema: {
+            name: schemaName,
+            strict: true,
+            schema,
+          },
+        },
+      });
+      const parsed = parseJsonLenient(text, "OpenRouter");
+      return { parsed, response: raw, responseText: text };
+    } catch (err) {
+      // 2) Fallback: json_object mode
+      try {
+        const { text, raw } = await openrouterChatCompletions({
+          model,
+          prompt,
+          responseFormat: { type: "json_object" },
+        });
+        const parsed = parseJsonLenient(text, "OpenRouter");
+        return { parsed, response: raw, responseText: text };
+      } catch {
+        // 3) Final fallback: prompt-only (no response_format)
+        const { text, raw } = await openrouterChatCompletions({
+          model,
+          prompt: `${prompt}\n\nReturn ONLY valid JSON. Do not include markdown or commentary.`,
+          responseFormat: null,
+        });
+        const parsed = parseJsonLenient(text, "OpenRouter");
+        return { parsed, response: raw, responseText: text };
+      }
+    }
+  }
+
+  if (llm.provider === "gemini") {
+    const model = normalizeString(llm.model, GEMINI_MODEL_DEFAULT);
+    const { text, raw } = await geminiGenerateContent({ model, prompt, schema });
+    const parsed = parseJsonLenient(text, "Gemini");
+    return { parsed, response: raw, responseText: text };
+  }
+
+  throw new Error(`Unsupported LLM provider: ${llm.provider}`);
 }
 
 function buildFallbackOpportunity({ messageId, subject, from, textBody, links }) {
@@ -390,8 +671,10 @@ function buildFallbackOpportunity({ messageId, subject, from, textBody, links })
   ];
 }
 
-async function extractOpportunitiesFromEmail(emailContext) {
-  if (!ai) return buildFallbackOpportunity(emailContext);
+async function extractOpportunitiesFromEmail(emailContext, llm) {
+  if (!llm || llm.provider === "disabled") return buildFallbackOpportunity(emailContext);
+  if (llm.provider === "openrouter" && !OPENROUTER_API_KEY) return buildFallbackOpportunity(emailContext);
+  if (llm.provider === "gemini" && !geminiAi) return buildFallbackOpportunity(emailContext);
 
   const prompt = [
     "Extract ALL distinct job opportunities from this email payload.",
@@ -421,6 +704,8 @@ async function extractOpportunitiesFromEmail(emailContext) {
     const { parsed, responseText } = await generateStructuredJson({
       prompt,
       schema: EXTRACTION_SCHEMA,
+      llm,
+      schemaName: "opportunity_extraction",
     });
 
     const opportunities = Array.isArray(parsed?.opportunities) ? parsed.opportunities : [];
@@ -476,11 +761,29 @@ async function extractOpportunitiesFromEmail(emailContext) {
   }
 }
 
-async function enrichOpportunityWithUrls(opportunity, emailLinks) {
-  if (!ai) {
+async function enrichOpportunityWithUrls(opportunity, emailLinks, llm) {
+  if (!llm || llm.provider === "disabled") {
     return {
       ...opportunity,
-      enrichment_status: "skipped_no_gemini",
+      enrichment_status: "skipped_no_llm",
+      enrichment_error: null,
+      url_context_metadata: null,
+    };
+  }
+
+  if (llm.provider === "openrouter" && !OPENROUTER_API_KEY) {
+    return {
+      ...opportunity,
+      enrichment_status: "skipped_missing_openrouter_key",
+      enrichment_error: null,
+      url_context_metadata: null,
+    };
+  }
+
+  if (llm.provider === "gemini" && !geminiAi) {
+    return {
+      ...opportunity,
+      enrichment_status: "skipped_missing_gemini_key",
       enrichment_error: null,
       url_context_metadata: null,
     };
@@ -501,22 +804,25 @@ async function enrichOpportunityWithUrls(opportunity, emailLinks) {
     };
   }
 
+  const urlContexts = await fetchUrlContexts(candidateUrls);
+
   const prompt = [
-    "Given this candidate job opportunity and URL list, use URL context to enrich the role.",
+    "Given this candidate job opportunity and URL context, enrich the role.",
     "Return the best posting_url, apply_url, clean job_title/company/location, detailed description, and required_skills.",
     "",
     "CANDIDATE_JOB_JSON:",
     JSON.stringify(opportunity, null, 2),
     "",
-    "URLS:",
-    JSON.stringify(candidateUrls.slice(0, MAX_LINKS_PER_EMAIL), null, 2),
+    "URL_CONTEXT_JSON:",
+    JSON.stringify(urlContexts, null, 2),
   ].join("\n");
 
   try {
-    const { parsed, response } = await generateStructuredJson({
+    const { parsed } = await generateStructuredJson({
       prompt,
       schema: ENRICHMENT_SCHEMA,
-      tools: [{ urlContext: {} }],
+      llm,
+      schemaName: "opportunity_enrichment",
     });
 
     return {
@@ -543,7 +849,7 @@ async function enrichOpportunityWithUrls(opportunity, emailLinks) {
           : opportunity.confidence,
       enrichment_status: "enriched",
       enrichment_error: null,
-      url_context_metadata: response?.candidates?.[0]?.urlContextMetadata || null,
+      url_context_metadata: { fetched_urls: urlContexts },
     };
   } catch (err) {
     return {
@@ -579,13 +885,13 @@ async function fetchBaseProfile(supabase, userId) {
   };
 }
 
-async function generateTailoredResume(baseProfile, opportunity) {
-  if (!ai) {
+async function generateTailoredResume(baseProfile, opportunity, llm) {
+  if (!llm || llm.provider === "disabled") {
     return {
       resume_json: {
         name: baseProfile.personal_info?.name || "Candidate",
         contact: baseProfile.personal_info?.email || "",
-        summary: "Gemini disabled - using base profile fallback",
+        summary: "LLM disabled - using base profile fallback",
         experience: [],
         education: [],
         skills: baseProfile.skills || [],
@@ -593,7 +899,43 @@ async function generateTailoredResume(baseProfile, opportunity) {
         projects: [],
       },
       highlighted_keywords: [],
-      rationale: "Gemini is disabled; using base profile as fallback.",
+      rationale: "LLM is disabled; using base profile as fallback.",
+      generation_error: "LLM is disabled",
+    };
+  }
+
+  if (llm.provider === "openrouter" && !OPENROUTER_API_KEY) {
+    return {
+      resume_json: {
+        name: baseProfile.personal_info?.name || "Candidate",
+        contact: baseProfile.personal_info?.email || "",
+        summary: "OpenRouter key missing - using base profile fallback",
+        experience: [],
+        education: [],
+        skills: baseProfile.skills || [],
+        certifications: [],
+        projects: [],
+      },
+      highlighted_keywords: [],
+      rationale: "OPENROUTER_API_KEY is not set; using base profile fallback.",
+      generation_error: "OPENROUTER_API_KEY is not set",
+    };
+  }
+
+  if (llm.provider === "gemini" && !geminiAi) {
+    return {
+      resume_json: {
+        name: baseProfile.personal_info?.name || "Candidate",
+        contact: baseProfile.personal_info?.email || "",
+        summary: "Gemini key missing - using base profile fallback",
+        experience: [],
+        education: [],
+        skills: baseProfile.skills || [],
+        certifications: [],
+        projects: [],
+      },
+      highlighted_keywords: [],
+      rationale: "GEMINI_API_KEY is not set; using base profile fallback.",
       generation_error: "GEMINI_API_KEY is not set",
     };
   }
@@ -654,6 +996,8 @@ async function generateTailoredResume(baseProfile, opportunity) {
     const { parsed } = await generateStructuredJson({
       prompt,
       schema: RESUME_SCHEMA,
+      llm,
+      schemaName: "tailored_resume",
     });
 
     return {
@@ -1137,9 +1481,10 @@ async function handlePoll({ syncAll = false } = {}) {
     stats.integrationsFound = integrations.length;
 
     console.log(`Found ${integrations.length} integration(s).`);
-    if (!ai) {
+
+    if (!OPENROUTER_API_KEY && !GEMINI_API_KEY) {
       console.warn(
-        "GEMINI_API_KEY is not set. Falling back to non-LLM extraction and base-profile resumes.",
+        "No LLM API keys detected (OPENROUTER_API_KEY / GEMINI_API_KEY). Poller will use non-LLM fallbacks.",
       );
     }
 
@@ -1154,6 +1499,8 @@ async function handlePoll({ syncAll = false } = {}) {
         job_keywords,
         keyword_match_scope,
         max_emails_per_sync,
+        llm_provider,
+        llm_model,
       } = integration;
 
       // Determine effective email limit for this user
@@ -1168,6 +1515,21 @@ async function handlePoll({ syncAll = false } = {}) {
           ? [...new Set(job_keywords.map((k) => String(k).trim().toLowerCase()).filter(Boolean))]
           : DEFAULT_KEYWORDS;
       const matchInBody = keyword_match_scope === "subject_or_body";
+
+      const providerCandidate = normalizeString(llm_provider, LLM_PROVIDER_DEFAULT).toLowerCase();
+      const provider =
+        providerCandidate === "openrouter" || providerCandidate === "gemini" || providerCandidate === "disabled"
+          ? providerCandidate
+          : LLM_PROVIDER_DEFAULT;
+
+      const model =
+        provider === "openrouter"
+          ? normalizeString(llm_model, OPENROUTER_MODEL_DEFAULT)
+          : provider === "gemini"
+            ? normalizeString(llm_model, GEMINI_MODEL_DEFAULT)
+            : "";
+
+      const llm = { provider, model };
 
       try {
         const password = await decrypt(imap_password_encrypted, encryption_iv);
@@ -1221,12 +1583,12 @@ async function handlePoll({ syncAll = false } = {}) {
           if (!matches) continue;
           stats.emailsKeywordMatched += 1;
 
-          const opportunities = await extractOpportunitiesFromEmail(emailContext);
+          const opportunities = await extractOpportunitiesFromEmail(emailContext, llm);
           stats.opportunitiesExtracted += opportunities.length;
           let messagePersisted = false;
 
           for (const extracted of opportunities) {
-            const enriched = await enrichOpportunityWithUrls(extracted, emailContext.links);
+            const enriched = await enrichOpportunityWithUrls(extracted, emailContext.links, llm);
             const primaryUrl =
               enriched.apply_url ||
               enriched.posting_url ||
@@ -1281,9 +1643,11 @@ async function handlePoll({ syncAll = false } = {}) {
               source_links: emailContext.links,
               status: "prepared",
               extracted_skills: normalizeStringArray(enriched.required_skills, 60),
-              extraction_model: GEMINI_MODEL,
+              extraction_model: llm.provider === "disabled" ? null : llm.model,
               extraction_confidence: enriched.confidence,
               extraction_raw: {
+                llm_provider: llm.provider,
+                llm_model: llm.model,
                 extraction: extracted.raw || null,
                 enrichment_status: enriched.enrichment_status || null,
                 enrichment_error: enriched.enrichment_error || null,
@@ -1313,7 +1677,7 @@ async function handlePoll({ syncAll = false } = {}) {
               const resumeGeneration = await generateTailoredResume(baseProfile, {
                 ...enriched,
                 ...insertedJob,
-              });
+              }, llm);
               const pdfBytes = await renderResumePdf(
                 {
                   job_title: insertedJob.job_title,
